@@ -26,14 +26,19 @@ owns the picture.
 
 3. **CanvasTexture → ShaderMaterial.** That 2D canvas is wrapped in a
    `THREE.CanvasTexture`, set to `needsUpdate = true` each frame, and
-   applied to a `PlaneGeometry(3.2, 3.2, 192, 192)` — a heavily subdivided
+   applied to a `PlaneGeometry(3.2, 3.2, 144, 144)` — a heavily subdivided
    plane so it can deform smoothly.
 
 4. **Domain-warped vertex shader.** The plane's z-coordinate is displaced
-   by an iterative sin/cos warp (Inigo Quilez–style flow): one pass of
-   `warp(p)` is fed back into a second pass, then summed with two slow
-   underlying waves. This produces long organic curves rather than a single
-   ripple — in the spirit of the Shadertoy reference that inspired it.
+   by an almost-verbatim port of Inigo Quilez's
+   [Base warp fBM](https://www.shadertoy.com/view/3sfczf) shader:
+   `sin(x)*sin(y)` as a cheap noise primitive, `fbm4` / `fbm6` stacking
+   rotated octaves (matrix `m`, frequency multiplier `2.02`), and a
+   `baseWarp` function that runs two passes of domain warping
+   (`q → o → n`) before a final fBM, then sharpens with
+   `mix(f, f*f*f*3.5, f * |n.x|)`. The result is sampled per-vertex and
+   used as the height field — same flowing curves as the original, but
+   pushed into geometry instead of pixels.
 
 5. **Fragment shader.** Samples the canvas texture, converts to luminance
    for a pure black-and-white look, applies a soft vignette, and brightens
