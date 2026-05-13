@@ -69,6 +69,14 @@ at runtime from `esm.sh`. No build step.
 
 ## Controls
 
-- **Click** anywhere on the surface to focus the editor.
+- **Click** to move the caret. A `THREE.Raycaster` hits the un-warped
+  plane geometry, the hit's UV is mapped back into texture pixel
+  coordinates, then the renderer's per-line font logic (the same
+  `measureText` walk it uses to draw the caret) figures out the
+  closest line + column. Approximate near the steepest parts of the
+  warp, but lands on the intended word.
+- **Drag** to select. Pointer capture keeps the selection live even
+  when the cursor leaves the window edge. The selected range is drawn
+  on the texture as a translucent rectangle.
 - **Type** markdown — headings, lists, fences, blockquotes all render.
 - **Arrow keys / Home / End / Cmd-Z** — standard CodeMirror bindings.

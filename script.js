@@ -27,11 +27,9 @@ const view = new EditorView({
   parent: document.getElementById("editor-host"),
 });
 
-// Auto-focus, and refocus when the user clicks the 3D surface.
 view.focus();
-document.getElementById("stage").addEventListener("pointerdown", () => {
-  view.focus();
-});
+// Pointer handling is set up further down, once the scene + raycaster
+// exist (we need the mesh to hit-test against).
 
 // ------------------------------------------------------------------
 // 2. Texture canvas — a stylised render of the editor document
@@ -84,7 +82,11 @@ function renderTexture() {
   tctx.fillRect(0, 0, TEX, TEX);
 
   const doc = view.state.doc;
-  const head = view.state.selection.main.head;
+  const sel = view.state.selection.main;
+  const head = sel.head;
+  const selFrom = Math.min(sel.from, sel.to);
+  const selTo = Math.max(sel.from, sel.to);
+  const hasRange = selFrom !== selTo;
   const cursorLineInfo = doc.lineAt(head);
   const cursorLine = cursorLineInfo.number - 1; // 0-indexed
   const cursorCol = head - cursorLineInfo.from;
@@ -114,6 +116,18 @@ function renderTexture() {
     if (s.bar) {
       tctx.fillStyle = "#fff";
       tctx.fillRect(PADDING - 30, y + 8, 8, s.size - 16);
+    }
+
+    // Selection highlight on this line.
+    if (hasRange && selFrom <= line.to && selTo >= line.from) {
+      const startCol = Math.max(0, selFrom - line.from);
+      const endCol = Math.min(line.text.length, selTo - line.from);
+      const x1 = PADDING + tctx.measureText(line.text.slice(0, startCol)).width;
+      const x2 = PADDING + tctx.measureText(line.text.slice(0, endCol)).width;
+      const extendsPastEol = selTo > line.to;
+      const xEnd = extendsPastEol ? TEX - PADDING : Math.max(x2, x1 + 12);
+      tctx.fillStyle = "rgba(255,255,255,0.28)";
+      tctx.fillRect(x1, y + 4, xEnd - x1, s.size);
     }
 
     tctx.fillStyle = "#fff";
@@ -254,7 +268,94 @@ const mesh = new THREE.Mesh(geometry, material);
 scene.add(mesh);
 
 // ------------------------------------------------------------------
-// 4. Resize + animation loop
+// 4. Click + drag to move the caret / select text.
+// ------------------------------------------------------------------
+// Raycasting hits the un-warped CPU geometry, not the GPU-displaced
+// surface, so the mapping is approximate near the steepest parts of
+// the warp — but good enough that clicks land on the intended word.
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+
+// Convert a screen-space pointer event into a CodeMirror document
+// position, by raycasting the pointer onto the plane, mapping the
+// hit's UV back into the texture canvas, then reusing the same
+// per-line font logic the renderer uses to pick a column.
+function docPosFromPointer(event) {
+  ndc.x = (event.clientX / window.innerWidth) * 2 - 1;
+  ndc.y = -(event.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObject(mesh);
+  if (!hits.length || !hits[0].uv) return null;
+
+  const uv = hits[0].uv;
+  // The texture is uploaded with flipY = true (three.js default for
+  // CanvasTexture), so uv.y = 1 corresponds to canvas y = 0.
+  const px = uv.x * TEX;
+  const py = (1 - uv.y) * TEX;
+
+  const doc = view.state.doc;
+
+  // Pixel y -> visible row -> doc line number.
+  const row = Math.floor((py - PADDING) / LINE_HEIGHT);
+  let lineNumber = scrollTopLine + 1 + row;
+  if (lineNumber < 1) lineNumber = 1;
+  if (lineNumber > doc.lines) lineNumber = doc.lines;
+  const line = doc.line(lineNumber);
+
+  // Pixel x -> column. Set the same font this line is drawn with,
+  // then walk characters until the cumulative width passes the click.
+  setFont(lineStyle(line.text));
+  const targetX = Math.max(0, px - PADDING);
+  let col = line.text.length;
+  let prevW = 0;
+  for (let i = 1; i <= line.text.length; i++) {
+    const w = tctx.measureText(line.text.slice(0, i)).width;
+    // Snap to whichever side of this glyph's midpoint the click fell on.
+    if (targetX < (prevW + w) / 2) {
+      col = i - 1;
+      break;
+    }
+    prevW = w;
+  }
+
+  return line.from + col;
+}
+
+let dragging = false;
+let dragAnchor = 0;
+
+const stageEl = document.getElementById("stage");
+
+stageEl.addEventListener("pointerdown", (e) => {
+  const pos = docPosFromPointer(e);
+  if (pos !== null) {
+    dragAnchor = pos;
+    dragging = true;
+    stageEl.setPointerCapture(e.pointerId);
+    view.dispatch({ selection: { anchor: pos, head: pos } });
+  }
+  view.focus();
+});
+
+stageEl.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  const pos = docPosFromPointer(e);
+  if (pos === null) return;
+  view.dispatch({ selection: { anchor: dragAnchor, head: pos } });
+});
+
+function endDrag(e) {
+  if (!dragging) return;
+  dragging = false;
+  try {
+    stageEl.releasePointerCapture(e.pointerId);
+  } catch {}
+}
+stageEl.addEventListener("pointerup", endDrag);
+stageEl.addEventListener("pointercancel", endDrag);
+
+// ------------------------------------------------------------------
+// 5. Resize + animation loop
 // ------------------------------------------------------------------
 function resize() {
   const w = window.innerWidth;
