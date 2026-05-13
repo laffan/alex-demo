@@ -169,67 +169,45 @@ texture.minFilter = THREE.LinearFilter;
 texture.magFilter = THREE.LinearFilter;
 texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
 
-const geometry = new THREE.PlaneGeometry(3.2, 3.2, 144, 144);
+const geometry = new THREE.PlaneGeometry(3.2, 3.2, 192, 192);
 
-// Vertex displacement using Inigo Quilez's "Base warp fBM" shader
-// (Shadertoy 3sfczf), ported almost verbatim. sin(x)*sin(y) acts as a
-// cheap noise primitive; fbm4 / fbm6 stack rotated octaves; func() does
-// two passes of domain warping (q → o → n) before a final fBM, then a
-// non-linear sharpen via mix(f, f^3 * 3.5, f * |n.x|). We sample this
-// per-vertex and push the plane's z by the result.
+// Two-pass domain-warped vertex displacement. Each pass of warp() is a
+// pair of sin/cos terms cross-mixing the input coordinates; we feed the
+// first pass's output into the second so the output is "warp of a warp"
+// rather than a single ripple. The result + a couple of slow underlying
+// waves goes into pos.z, giving the plane a floaty, organic bend that
+// stays readable through the text.
 const vertexShader = /* glsl */ `
   uniform float uTime;
   varying vec2 vUv;
   varying float vWarp;
 
-  const mat2 m = mat2(0.80, 0.60, -0.60, 0.80);
-
-  float noise(vec2 p) {
-    return sin(p.x) * sin(p.y);
-  }
-
-  float fbm4(vec2 p) {
-    float f = 0.0;
-    f += 0.5000 * noise(p); p = m * p * 2.02;
-    f += 0.2500 * noise(p); p = m * p * 2.02;
-    f += 0.1250 * noise(p); p = m * p * 2.02;
-    f += 0.0625 * noise(p);
-    return f / 0.9375;
-  }
-
-  float fbm6(vec2 p) {
-    float f = 0.0;
-    f += 0.500 * (0.5 + 0.5 * noise(p)); p = m * p * 2.02;
-    f += 0.500 * (0.5 + 0.5 * noise(p)); p = m * p * 2.02;
-    f += 0.500 * (0.5 + 0.5 * noise(p)); p = m * p * 2.02;
-    f += 0.250 * (0.5 + 0.5 * noise(p));
-    return f / 0.96875;
-  }
-
-  vec2 fbm4_2(vec2 p) {
-    return vec2(fbm4(p), fbm4(p + vec2(7.8)));
-  }
-
-  vec2 fbm6_2(vec2 p) {
-    return vec2(fbm6(p + vec2(16.8)), fbm6(p + vec2(11.5)));
-  }
-
-  float baseWarp(vec2 q, float t) {
-    q += 0.03 * sin(vec2(0.27, 0.23) * t + length(q) * vec2(4.1, 4.3));
-    vec2 o = fbm4_2(0.9 * q);
-    o += 0.04 * sin(vec2(0.12, 0.14) * t + length(o));
-    vec2 n = fbm6_2(3.0 * o);
-    float f = 0.5 + 0.5 * fbm4(1.8 * q + 6.0 * n);
-    return mix(f, f * f * f * 3.5, f * abs(n.x));
+  vec2 warp(vec2 p, float t) {
+    vec2 q = vec2(
+      sin(p.y * 1.7 + t * 0.6) + cos(p.x * 1.3 - t * 0.4),
+      sin(p.x * 1.9 - t * 0.5) + cos(p.y * 1.1 + t * 0.7)
+    );
+    vec2 r = vec2(
+      sin(p.x + q.x * 1.4 + t * 0.3),
+      cos(p.y + q.y * 1.4 - t * 0.2)
+    );
+    return r;
   }
 
   void main() {
     vUv = uv;
     vec3 pos = position;
-    float f = baseWarp(pos.xy * 0.9, uTime * 0.35);
-    float h = (f - 0.5) * 0.35;
+
+    vec2 p = pos.xy * 1.2;
+    vec2 w1 = warp(p, uTime);
+    vec2 w2 = warp(p + w1, uTime * 0.7);
+    float h = (w1.x + w2.y) * 0.18
+            + sin(pos.x * 2.3 + uTime * 0.8) * 0.06
+            + cos(pos.y * 2.1 - uTime * 0.6) * 0.06;
+
     pos.z += h;
     vWarp = h;
+
     gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
   }
 `;
