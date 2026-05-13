@@ -9,10 +9,9 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #000;
-  color: #fff;
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    sans-serif;
+  background: #efe5cb;
+  color: #1f1209;
+  font-family: "Trocchi", Georgia, serif;
 }
 
 #stage {
@@ -23,20 +22,24 @@ body {
   display: block;
   cursor: text;
   outline: none;
+  z-index: 1;
 }
 
-/* The CodeMirror instance lives here, off-screen.
-   It owns all keyboard input, selection state, history, etc.
-   We paint a stylised copy of its document onto a 2D canvas each frame
-   and that canvas becomes the WebGL texture. */
+/* The CodeMirror instance lives here. It owns all keyboard input,
+   selection state, and history. Rather than hide it with opacity: 0
+   or push it off-screen (Firefox refuses to route keystrokes to
+   contenteditable elements in either of those states), we render it
+   at full size on-screen and visually cover it with the WebGL canvas
+   via z-index. Firefox sees a fully-rendered, in-viewport element and
+   is happy to send it key events; the user never sees it. */
 #editor-host {
   position: fixed;
   top: 0;
-  left: -20000px;
+  left: 0;
   width: 1200px;
   height: 1600px;
   pointer-events: none;
-  opacity: 0;
+  z-index: 0;
 }
 
 #hint {
@@ -48,8 +51,10 @@ body {
   font-size: 11px;
   letter-spacing: 0.25em;
   text-transform: uppercase;
-  opacity: 0.45;
+  color: #1f1209;
+  opacity: 0.55;
   pointer-events: none;
-  mix-blend-mode: difference;
-  z-index: 10;
+  z-index: 2;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
 }

@@ -3,23 +3,17 @@ import { markdown } from "https://esm.sh/@codemirror/lang-markdown@6.2.4";
 import * as THREE from "https://esm.sh/three@0.160.0";
 
 // ------------------------------------------------------------------
+// 0. Palette — dark brown on light tan.
+// ------------------------------------------------------------------
+const BG_HEX = "#efe5cb";
+const FG_HEX = "#1f1209";
+const SELECTION_RGBA = "rgba(31, 18, 9, 0.22)";
+const BORDER_RGBA = "rgba(31, 18, 9, 0.18)";
+
+// ------------------------------------------------------------------
 // 1. Hidden CodeMirror 6 editor (owns input, selection, history)
 // ------------------------------------------------------------------
-const initialDoc = `# editor in 3d
-
-a *markdown* editor living
-on a **warped plane**.
-
-- type to update the texture
-- arrow keys move the cursor
-- the text is the light source
-
-\`\`\`
-const dream = "code in the void";
-\`\`\`
-
-> the screen bends.
-> the words remain.`;
+const initialDoc = `Alice was beginning to get very tired of sitting by her sister on the bank, and of having nothing to do: once or twice she had peeped into the book her sister was reading, but it had no pictures or conversations in it, “and what is the use of a book,” thought Alice “without pictures or conversations?”`;
 
 const view = new EditorView({
   doc: initialDoc,
@@ -28,11 +22,9 @@ const view = new EditorView({
 });
 
 view.focus();
-// Pointer handling is set up further down, once the scene + raycaster
-// exist (we need the mesh to hit-test against).
 
 // ------------------------------------------------------------------
-// 2. Texture canvas — a stylised render of the editor document
+// 2. Texture canvas — a stylised render of the editor document.
 // ------------------------------------------------------------------
 const TEX = 2048;
 const texCanvas = document.createElement("canvas");
@@ -41,17 +33,20 @@ texCanvas.height = TEX;
 const tctx = texCanvas.getContext("2d");
 
 const FONT_SIZE = 100;
-const LINE_HEIGHT = 120;
+const LINE_HEIGHT = 118;
 const PADDING = 80;
-const FONT_FAMILY =
-  '"SF Mono", "JetBrains Mono", "Menlo", "Monaco", "Consolas", monospace';
+const FONT_FAMILY = '"Trocchi", Georgia, serif';
 
 let cursorBlink = true;
 setInterval(() => {
   cursorBlink = !cursorBlink;
 }, 530);
 
-let scrollTopLine = 0;
+// The viewport is expressed in *visual* rows (post-wrap), not logical
+// lines, because one CodeMirror line can wrap to many texture rows.
+let scrollTopRow = 0;
+// Rebuilt every frame; click handlers also use it for hit testing.
+let visualRows = [];
 
 function lineStyle(text) {
   const h = /^(#{1,6})\s+/.exec(text);
@@ -77,66 +72,141 @@ function setFont(s) {
   tctx.font = `${s.style} ${s.weight} ${s.size}px ${FONT_FAMILY}`;
 }
 
+// Greedy word wrap. Returns segments [{text, startCol}] where startCol
+// is the column index in the logical line at which the segment starts —
+// keeping that index lets caret / selection / hit-testing math walk
+// between logical and visual coordinates without any extra bookkeeping.
+function wrapText(text, maxWidth) {
+  if (text.length === 0) return [{ text: "", startCol: 0 }];
+  const tokens = text.match(/\s+|\S+/g) || [];
+  const segs = [];
+  let segStart = 0;
+  let segText = "";
+  let pos = 0;
+  for (const tok of tokens) {
+    const test = segText + tok;
+    if (tctx.measureText(test).width > maxWidth && segText.length > 0) {
+      segs.push({ text: segText, startCol: segStart });
+      segStart = pos;
+      segText = tok;
+    } else {
+      segText = test;
+    }
+    pos += tok.length;
+  }
+  if (segText.length > 0 || segs.length === 0) {
+    segs.push({ text: segText, startCol: segStart });
+  }
+  return segs;
+}
+
+function computeLayout() {
+  const doc = view.state.doc;
+  const rows = [];
+  const maxWidth = TEX - 2 * PADDING;
+  for (let lineNum = 1; lineNum <= doc.lines; lineNum++) {
+    const line = doc.line(lineNum);
+    const style = lineStyle(line.text);
+    setFont(style);
+    const segs = wrapText(line.text, maxWidth);
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i];
+      const startDocPos = line.from + seg.startCol;
+      rows.push({
+        text: seg.text,
+        startDocPos,
+        endDocPos: startDocPos + seg.text.length,
+        style,
+        isFirstInLine: i === 0,
+        isLastInLine: i === segs.length - 1,
+      });
+    }
+  }
+  return rows;
+}
+
+// Among rows whose doc range covers `head`, pick the *last* — that way
+// a cursor sitting exactly on a wrap break renders on the new visual
+// row (where the next typed character will actually appear) rather
+// than at the trailing-space end of the previous row.
+function findCursorRow(rows, head) {
+  let best = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (r.startDocPos <= head && head <= r.endDocPos) {
+      best = i;
+    } else if (r.startDocPos > head) {
+      break;
+    }
+  }
+  return best;
+}
+
 function renderTexture() {
-  tctx.fillStyle = "#000";
+  tctx.fillStyle = BG_HEX;
   tctx.fillRect(0, 0, TEX, TEX);
 
-  const doc = view.state.doc;
+  visualRows = computeLayout();
+
   const sel = view.state.selection.main;
   const head = sel.head;
   const selFrom = Math.min(sel.from, sel.to);
   const selTo = Math.max(sel.from, sel.to);
   const hasRange = selFrom !== selTo;
-  const cursorLineInfo = doc.lineAt(head);
-  const cursorLine = cursorLineInfo.number - 1; // 0-indexed
-  const cursorCol = head - cursorLineInfo.from;
 
-  // Keep the cursor visible by scrolling the texture viewport.
-  const visibleLines = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
-  if (cursorLine < scrollTopLine) scrollTopLine = cursorLine;
-  if (cursorLine >= scrollTopLine + visibleLines)
-    scrollTopLine = cursorLine - visibleLines + 1;
-  if (scrollTopLine < 0) scrollTopLine = 0;
+  const cursorRowIdx = findCursorRow(visualRows, head);
+  const visibleRowCount = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
 
-  // Faint border so the plane has a recognisable frame.
-  tctx.strokeStyle = "rgba(255,255,255,0.35)";
+  if (cursorRowIdx < scrollTopRow) scrollTopRow = cursorRowIdx;
+  if (cursorRowIdx >= scrollTopRow + visibleRowCount)
+    scrollTopRow = cursorRowIdx - visibleRowCount + 1;
+  if (scrollTopRow < 0) scrollTopRow = 0;
+
+  // Faint border so the plane has a recognisable frame against the
+  // (same-coloured) page background.
+  tctx.strokeStyle = BORDER_RGBA;
   tctx.lineWidth = 6;
   tctx.strokeRect(20, 20, TEX - 40, TEX - 40);
 
   tctx.textBaseline = "alphabetic";
 
   let y = PADDING;
-  for (let i = scrollTopLine + 1; i <= doc.lines; i++) {
-    const line = doc.line(i);
-    const s = lineStyle(line.text);
+  for (let r = scrollTopRow; r < visualRows.length; r++) {
+    const row = visualRows[r];
+    const s = row.style;
     setFont(s);
-
     const baseline = y + s.size * 0.85;
 
-    if (s.bar) {
-      tctx.fillStyle = "#fff";
+    if (s.bar && row.isFirstInLine) {
+      tctx.fillStyle = FG_HEX;
       tctx.fillRect(PADDING - 30, y + 8, 8, s.size - 16);
     }
 
-    // Selection highlight on this line.
-    if (hasRange && selFrom <= line.to && selTo >= line.from) {
-      const startCol = Math.max(0, selFrom - line.from);
-      const endCol = Math.min(line.text.length, selTo - line.from);
-      const x1 = PADDING + tctx.measureText(line.text.slice(0, startCol)).width;
-      const x2 = PADDING + tctx.measureText(line.text.slice(0, endCol)).width;
-      const extendsPastEol = selTo > line.to;
-      const xEnd = extendsPastEol ? TEX - PADDING : Math.max(x2, x1 + 12);
-      tctx.fillStyle = "rgba(255,255,255,0.28)";
+    // Selection highlight covers the overlap of [selFrom, selTo] with
+    // this row's doc range; if the selection spills past this row's
+    // end-of-row, extend the rect to the right edge so the highlight
+    // flows visually across the wrap break.
+    if (hasRange && selTo > row.startDocPos && selFrom <= row.endDocPos) {
+      const startCol = Math.max(0, selFrom - row.startDocPos);
+      const endCol = Math.min(row.text.length, selTo - row.startDocPos);
+      const x1 = PADDING + tctx.measureText(row.text.slice(0, startCol)).width;
+      const x2 = PADDING + tctx.measureText(row.text.slice(0, endCol)).width;
+      const extendsPastRow = selTo > row.endDocPos;
+      const xEnd = extendsPastRow ? TEX - PADDING : Math.max(x2, x1 + 12);
+      tctx.fillStyle = SELECTION_RGBA;
       tctx.fillRect(x1, y + 4, xEnd - x1, s.size);
     }
 
-    tctx.fillStyle = "#fff";
-    tctx.fillText(line.text, PADDING, baseline);
+    tctx.fillStyle = FG_HEX;
+    tctx.fillText(row.text, PADDING, baseline);
 
-    // Cursor caret
-    if (i - 1 === cursorLine && cursorBlink) {
-      const w = tctx.measureText(line.text.slice(0, cursorCol)).width;
-      tctx.fillStyle = "#fff";
+    if (r === cursorRowIdx && cursorBlink) {
+      const localCol = Math.min(
+        Math.max(0, head - row.startDocPos),
+        row.text.length,
+      );
+      const w = tctx.measureText(row.text.slice(0, localCol)).width;
+      tctx.fillStyle = FG_HEX;
       tctx.fillRect(PADDING + w, y + 6, 6, s.size - 4);
     }
 
@@ -146,7 +216,7 @@ function renderTexture() {
 }
 
 // ------------------------------------------------------------------
-// 3. three.js: warped plane sampling the texture
+// 3. three.js: warped plane sampling the texture.
 // ------------------------------------------------------------------
 const stage = document.getElementById("stage");
 const renderer = new THREE.WebGLRenderer({ canvas: stage, antialias: true });
@@ -154,7 +224,7 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight, false);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x000000);
+scene.background = new THREE.Color(BG_HEX);
 
 const camera = new THREE.PerspectiveCamera(
   42,
@@ -171,12 +241,7 @@ texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
 
 const geometry = new THREE.PlaneGeometry(3.2, 3.2, 192, 192);
 
-// Two-pass domain-warped vertex displacement. Each pass of warp() is a
-// pair of sin/cos terms cross-mixing the input coordinates; we feed the
-// first pass's output into the second so the output is "warp of a warp"
-// rather than a single ripple. The result + a couple of slow underlying
-// waves goes into pos.z, giving the plane a floaty, organic bend that
-// stays readable through the text.
+// Two-pass sin/cos domain warp — see the README for the design notes.
 const vertexShader = /* glsl */ `
   uniform float uTime;
   varying vec2 vUv;
@@ -212,6 +277,11 @@ const vertexShader = /* glsl */ `
   }
 `;
 
+// Colour-preserving fragment shader. Unlike the original B&W version,
+// this one keeps the tan/brown palette intact, applies a soft vignette
+// by darkening the edges toward a deeper tan, and uses vWarp to brighten
+// ridges and shadow the troughs — text legibility is preserved by
+// keeping the multiplier modest and clamping the result.
 const fragmentShader = /* glsl */ `
   uniform sampler2D uTex;
   varying vec2 vUv;
@@ -219,16 +289,13 @@ const fragmentShader = /* glsl */ `
 
   void main() {
     vec3 col = texture2D(uTex, vUv).rgb;
-    float l = dot(col, vec3(0.299, 0.587, 0.114));
 
-    // Subtle vignette
     float v = smoothstep(0.95, 0.15, length(vUv - 0.5));
-    l *= 0.55 + 0.45 * v;
+    col *= 0.82 + 0.18 * v;
 
-    // Brighten ridges, darken troughs — gives the warp a physical feel.
-    l *= 1.0 + vWarp * 1.2;
+    col = clamp(col * (1.0 + vWarp * 0.55), 0.0, 1.0);
 
-    gl_FragColor = vec4(vec3(l), 1.0);
+    gl_FragColor = vec4(col, 1.0);
   }
 `;
 
@@ -248,16 +315,9 @@ scene.add(mesh);
 // ------------------------------------------------------------------
 // 4. Click + drag to move the caret / select text.
 // ------------------------------------------------------------------
-// Raycasting hits the un-warped CPU geometry, not the GPU-displaced
-// surface, so the mapping is approximate near the steepest parts of
-// the warp — but good enough that clicks land on the intended word.
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 
-// Convert a screen-space pointer event into a CodeMirror document
-// position, by raycasting the pointer onto the plane, mapping the
-// hit's UV back into the texture canvas, then reusing the same
-// per-line font logic the renderer uses to pick a column.
 function docPosFromPointer(event) {
   ndc.x = (event.clientX / window.innerWidth) * 2 - 1;
   ndc.y = -(event.clientY / window.innerHeight) * 2 + 1;
@@ -266,37 +326,30 @@ function docPosFromPointer(event) {
   if (!hits.length || !hits[0].uv) return null;
 
   const uv = hits[0].uv;
-  // The texture is uploaded with flipY = true (three.js default for
-  // CanvasTexture), so uv.y = 1 corresponds to canvas y = 0.
   const px = uv.x * TEX;
   const py = (1 - uv.y) * TEX;
 
-  const doc = view.state.doc;
+  if (visualRows.length === 0) return null;
 
-  // Pixel y -> visible row -> doc line number.
-  const row = Math.floor((py - PADDING) / LINE_HEIGHT);
-  let lineNumber = scrollTopLine + 1 + row;
-  if (lineNumber < 1) lineNumber = 1;
-  if (lineNumber > doc.lines) lineNumber = doc.lines;
-  const line = doc.line(lineNumber);
+  const rowOffset = Math.floor((py - PADDING) / LINE_HEIGHT);
+  let rowIdx = scrollTopRow + rowOffset;
+  if (rowIdx < 0) rowIdx = 0;
+  if (rowIdx >= visualRows.length) rowIdx = visualRows.length - 1;
+  const row = visualRows[rowIdx];
 
-  // Pixel x -> column. Set the same font this line is drawn with,
-  // then walk characters until the cumulative width passes the click.
-  setFont(lineStyle(line.text));
+  setFont(row.style);
   const targetX = Math.max(0, px - PADDING);
-  let col = line.text.length;
+  let col = row.text.length;
   let prevW = 0;
-  for (let i = 1; i <= line.text.length; i++) {
-    const w = tctx.measureText(line.text.slice(0, i)).width;
-    // Snap to whichever side of this glyph's midpoint the click fell on.
+  for (let i = 1; i <= row.text.length; i++) {
+    const w = tctx.measureText(row.text.slice(0, i)).width;
     if (targetX < (prevW + w) / 2) {
       col = i - 1;
       break;
     }
     prevW = w;
   }
-
-  return line.from + col;
+  return row.startDocPos + col;
 }
 
 let dragging = false;
@@ -333,7 +386,8 @@ stageEl.addEventListener("pointerup", endDrag);
 stageEl.addEventListener("pointercancel", endDrag);
 
 // ------------------------------------------------------------------
-// 5. Resize + animation loop
+// 5. Resize + animation loop (deferred until Trocchi has loaded so
+//    the first few frames don't render in a fallback serif).
 // ------------------------------------------------------------------
 function resize() {
   const w = window.innerWidth;
@@ -353,4 +407,5 @@ function tick() {
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
-tick();
+
+document.fonts.load(`${FONT_SIZE}px "Trocchi"`).then(tick);

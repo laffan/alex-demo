@@ -1,13 +1,14 @@
 # Editor in 3D
 
 A live markdown editor rendered onto a domain-warped surface in WebGL.
-Click, drag, and type as if it were a normal editor; the surface bends
-underneath you.
+Dark brown letters in Trocchi on a light tan ground, bending in slow
+swells. Click, drag, and type as if it were a normal editor; the
+surface bends underneath you.
 
 This README is a walkthrough of how the effect is put together. It
 assumes you're comfortable with modern JS, the canvas 2D API, and at
-least the shape of WebGL / three.js — but not necessarily fBM noise
-or CodeMirror 6 internals.
+least the shape of WebGL / three.js — but not necessarily CodeMirror 6
+internals or domain warping.
 
 ---
 
@@ -61,31 +62,43 @@ const view = new EditorView({
 });
 ```
 
-`#editor-host` is parked off-screen in CSS:
+`#editor-host` is rendered on-screen at full size, but covered by the
+WebGL canvas via z-index:
 
 ```css
+#stage       { position: fixed; inset: 0; z-index: 1; }
 #editor-host {
   position: fixed;
   top: 0;
-  left: -20000px;
+  left: 0;
   width: 1200px;
   height: 1600px;
   pointer-events: none;
-  opacity: 0;
+  z-index: 0;
 }
 ```
 
-Two things are worth pointing out:
+Three things are worth pointing out:
 
-- **It's still a real DOM editor.** The contenteditable element exists,
-  it just lives at `left: -20000px`. That means everything CodeMirror
-  does — IME, clipboard, undo/redo, autocomplete, multi-cursor — still
-  works without us having to reimplement any of it. We're stealing its
+- **It's still a real DOM editor.** The contenteditable element exists
+  inside `#editor-host`. That means everything CodeMirror does — IME,
+  clipboard, undo/redo, autocomplete, multi-cursor — still works
+  without us having to reimplement any of it. We're stealing its
   brain, not building one.
 - **`pointer-events: none` matters.** If the editor host swallowed
   pointer events, our `<canvas>` would never see clicks. The canvas
   catches everything; we route input back into the editor with
   `view.focus()` and `view.dispatch(...)`.
+- **Hide it with z-index, not `opacity` or off-screen positioning.**
+  This is the part that bit me on Firefox. Chrome and Safari will
+  cheerfully send keystrokes to a contenteditable element no matter
+  how invisible it is — they only refuse on `display: none` and
+  `visibility: hidden`. Firefox is stricter: in practice it treats
+  `opacity: 0` (and elements positioned entirely outside the viewport)
+  as "not really there" for keyboard input, so `view.focus()` succeeds
+  but key events never arrive at CodeMirror's handler. Keeping the
+  element fully rendered and in-viewport, and just covering it with
+  the opaque canvas, sidesteps the whole class of issue.
 
 To read state out of CodeMirror, you only need three APIs:
 
@@ -124,73 +137,166 @@ every frame. Why this size?
   is fast at this size — Chrome will keep it on the GPU and copy
   intra-VRAM if your driver is happy.
 
-### One line at a time
+### Font and palette
 
-CodeMirror's `state.doc` is a rope-like text structure. We iterate
-logical lines:
+Body text is Trocchi at 100px, loaded from Google Fonts. Trocchi is a
+slabby serif with a single regular weight — for our markdown headings
+we just ask canvas for `font-weight: 700` and accept faux-bold; for
+fenced ``` lines we ask for italic and accept faux-italic. At 100px
+those synthetic styles read fine.
 
 ```js
-for (let i = scrollTopLine + 1; i <= doc.lines; i++) {
-  const line = doc.line(i);
-  const s = lineStyle(line.text);
-  setFont(s);
-  // ... draw selection rect, caret, then text
+const FONT_FAMILY = '"Trocchi", Georgia, serif';
+// ... near the bottom of script.js:
+document.fonts.load(`${FONT_SIZE}px "Trocchi"`).then(tick);
+```
+
+That last line is the gotcha. If you start the animation loop
+immediately, the first second or so of frames render in the fallback
+serif (Georgia) — then the real font pops in, every `measureText`
+suddenly returns different widths, and the caret jumps. The
+[CSS Font Loading API](https://developer.mozilla.org/en-US/docs/Web/API/CSS_Font_Loading_API)
+gives us a promise that resolves once Trocchi is actually ready;
+we wait on that before kicking off `requestAnimationFrame`.
+
+The colour palette is a deliberate two-tone:
+
+```js
+const BG_HEX = "#efe5cb";   // very light tan
+const FG_HEX = "#1f1209";   // nearly black, warm brown
+```
+
+— used for the texture background, the text, the caret, the selection
+overlay, *and* the three.js scene clear colour. The plane and the
+empty space around it share a colour, so only the warp's pseudo-light
+and the faint border tell you where the page ends and the room
+begins.
+
+### Wrapped layout
+
+The Alice text is a single ~300-character logical line. Without
+wrapping, it would shoot off the right edge of the texture in the
+first row. The painter does a greedy word-wrap pass each frame to
+break each logical line into one or more *visual rows*:
+
+```js
+function wrapText(text, maxWidth) {
+  const tokens = text.match(/\s+|\S+/g) || [];
+  const segs = [];
+  let segStart = 0, segText = "", pos = 0;
+  for (const tok of tokens) {
+    const test = segText + tok;
+    if (tctx.measureText(test).width > maxWidth && segText.length > 0) {
+      segs.push({ text: segText, startCol: segStart });
+      segStart = pos;
+      segText = tok;
+    } else {
+      segText = test;
+    }
+    pos += tok.length;
+  }
+  segs.push({ text: segText, startCol: segStart });
+  return segs;
 }
 ```
 
-`lineStyle()` looks at the raw markdown source and returns a font
-spec — bold for headings (heavier the smaller the `#` count), italic
-for fenced ``` lines, a gutter bar for blockquotes. We keep the
-markdown delimiters in the rendered text (we don't strip the `#`
-characters) — that way the character index in the rendered string is
-the same as the character index in the document. Cursor and selection
-math just works.
+Two design choices worth pointing out:
 
-### A viewport, not a paginator
+- **Tokenize into `\s+|\S+` runs.** Each token is either pure
+  whitespace or pure non-whitespace. Breaks are only allowed *between*
+  tokens, which is exactly the standard word-wrap rule. Trailing
+  spaces stay attached to the row they belong to, so clicking on a
+  trailing space resolves to the right column.
+- **Track `startCol` per segment.** Each visual row remembers the
+  logical-line column at which it starts. That single integer lets
+  every downstream operation (caret rendering, selection rendering,
+  hit testing, viewport scrolling) translate freely between visual
+  rows and CodeMirror document positions, without keeping a separate
+  bidirectional index.
 
-The texture only shows whatever fits. Rather than scroll the rendered
-text out of the canvas, we shift the **first** line we draw to keep
-the caret on screen:
+`computeLayout()` runs `wrapText` on every logical line and produces a
+flat list of visual rows:
 
 ```js
-const visibleLines = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
-if (cursorLine < scrollTopLine) scrollTopLine = cursorLine;
-if (cursorLine >= scrollTopLine + visibleLines)
-  scrollTopLine = cursorLine - visibleLines + 1;
+rows.push({
+  text: seg.text,
+  startDocPos: line.from + seg.startCol,
+  endDocPos:   line.from + seg.startCol + seg.text.length,
+  style,
+  isFirstInLine: i === 0,
+  isLastInLine:  i === segs.length - 1,
+});
 ```
 
-This is the same trick a terminal emulator uses: a "viewport" into a
-larger document, expressed as a starting line number.
+Once you have `startDocPos` / `endDocPos` per row, everything else
+falls out of it.
+
+`lineStyle()` looks at the raw markdown source of each logical line
+and returns a font spec — heavier weight for headings (more so the
+smaller the `#` count), italic for fenced ``` lines, a gutter bar for
+blockquotes. We keep the markdown delimiters in the rendered text (we
+don't strip the `#` characters) — that way the character index in the
+rendered string is the same as the character index in the document.
+
+### A viewport, in visual rows
+
+Once wrapping is in the picture, the viewport has to be expressed in
+visual rows, not logical lines — one CodeMirror line can wrap to a
+dozen rows, and the user expects to scroll through them one at a time.
+
+```js
+const cursorRowIdx = findCursorRow(visualRows, head);
+const visibleRowCount = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
+if (cursorRowIdx < scrollTopRow) scrollTopRow = cursorRowIdx;
+if (cursorRowIdx >= scrollTopRow + visibleRowCount)
+  scrollTopRow = cursorRowIdx - visibleRowCount + 1;
+```
+
+`findCursorRow` does one subtlety worth mentioning. When the caret
+sits exactly on a wrap break (e.g. cursor at column 30, the row above
+ends at column 30 with a trailing space, the row below starts at
+column 30), it has to pick *one* row to draw on. We pick the
+last-matching row — so a cursor on a wrap boundary is rendered at the
+start of the next visual row, where the next typed character will
+actually appear. Same convention every editor uses.
 
 ### The caret
 
 `tctx.measureText()` is the single most useful 2D-canvas API for this
-whole project. To draw the caret:
+whole project. To draw the caret, given the cursor row and the local
+column within it:
 
 ```js
-const w = tctx.measureText(line.text.slice(0, cursorCol)).width;
+const localCol = head - row.startDocPos;
+const w = tctx.measureText(row.text.slice(0, localCol)).width;
 tctx.fillRect(PADDING + w, y + 6, 6, s.size - 4);
 ```
 
-That's it — measure the substring before the caret, draw a 6px-wide
-white rectangle there. A `setInterval` flips a `cursorBlink` flag
+Measure the substring before the caret, draw a 6px-wide rectangle in
+the foreground colour. A `setInterval` flips a `cursorBlink` flag
 every 530ms so it blinks in the OS-conventional rhythm.
 
 ### Selection ranges
 
-Same idea, twice. For each visible line:
+Same idea, applied per visual row. For each row that overlaps
+`[selFrom, selTo]`:
 
 ```js
-const x1 = PADDING + tctx.measureText(line.text.slice(0, startCol)).width;
-const x2 = PADDING + tctx.measureText(line.text.slice(0, endCol)).width;
-const xEnd = extendsPastEol ? TEX - PADDING : Math.max(x2, x1 + 12);
-tctx.fillStyle = "rgba(255,255,255,0.28)";
+const startCol = Math.max(0, selFrom - row.startDocPos);
+const endCol   = Math.min(row.text.length, selTo - row.startDocPos);
+const x1 = PADDING + tctx.measureText(row.text.slice(0, startCol)).width;
+const x2 = PADDING + tctx.measureText(row.text.slice(0, endCol)).width;
+const extendsPastRow = selTo > row.endDocPos;
+const xEnd = extendsPastRow ? TEX - PADDING : Math.max(x2, x1 + 12);
+tctx.fillStyle = SELECTION_RGBA;
 tctx.fillRect(x1, y + 4, xEnd - x1, s.size);
 ```
 
-The `extendsPastEol` branch handles the "selection wraps onto the next
-line" case — we extend the rect to the right edge of the texture so
-it visually flows past the line break.
+The `extendsPastRow` branch handles the "selection continues onto the
+next row" case — we extend the rect to the right edge of the texture
+so the highlight visually flows past the wrap break and across the
+gap to the next row's start. The minimum width (`x1 + 12`) is so an
+empty-line selection still gets a visible sliver.
 
 ---
 
@@ -353,25 +459,40 @@ fragment-shader background — just not behind a text editor.
 ```glsl
 void main() {
   vec3 col = texture2D(uTex, vUv).rgb;
-  float l = dot(col, vec3(0.299, 0.587, 0.114));   // luminance
+
   float v = smoothstep(0.95, 0.15, length(vUv - 0.5));
-  l *= 0.55 + 0.45 * v;                            // soft vignette
-  l *= 1.0 + vWarp * 1.2;                          // ridges brighter
-  gl_FragColor = vec4(vec3(l), 1.0);
+  col *= 0.82 + 0.18 * v;                          // soft vignette
+
+  col = clamp(col * (1.0 + vWarp * 0.55), 0.0, 1.0); // ridges/troughs
+  gl_FragColor = vec4(col, 1.0);
 }
 ```
 
-The interesting line is `l *= 1.0 + vWarp * 1.2`. Because `vWarp` is
-the per-vertex displacement linearly interpolated across the fragment,
-the high points of the surface get brightened and the low points
-darkened. This isn't physically correct lighting — there are no
-normals, no light position — but the human eye reads "varying
-brightness along a varying height" as shading. It's the cheapest
-possible way to make the warp feel three-dimensional rather than
-flat-projected.
+This is deliberately a *colour-preserving* shader — we never convert
+to luminance — because the whole effect depends on keeping the tan
+and brown coming through cleanly. Two passes do the work:
 
-The luminance conversion + multiply-only operations guarantee the
-output stays grayscale, which is the look we want.
+- **The vignette** multiplies down toward `col * 0.82` at the edges
+  of the plane (where `v = 0`), keeping the centre near `col * 1.0`
+  (`v = 1`). On the tan body this reads as the corners falling into
+  shadow; on the dark text it does nothing visible. The `0.82 +
+  0.18 * v` formulation guarantees we never multiply *up*, so we
+  can't blow out the tan into white.
+- **`1.0 + vWarp * 0.55`** is the cheap pseudo-lighting trick.
+  `vWarp` is the per-vertex displacement, linearly interpolated
+  across the fragment, so high points of the surface get a multiplier
+  above 1 and low points get a multiplier below 1. There are no
+  normals, no light position — but the eye reads "brighter where
+  geometry is closer" as shading, and the surface gains a strong
+  sense of three-dimensionality for one multiply per pixel. The
+  `clamp` keeps the tan from blowing past white in the brightest
+  ridge crests.
+
+The two operations are intentionally subtle on the text (which is
+already near-zero in all channels, so multiplying by 0.82 or 1.5
+both round to "still very dark brown") and prominent on the tan body
+(where the multipliers shift it through visible swathes of light and
+deeper tan). The legibility budget stays intact.
 
 ---
 
@@ -419,27 +540,29 @@ get pixel coordinates. The `1 - uv.y` is the `flipY` accounting:
 since the GPU samples a top-flipped texture, our painter's y=0 (top)
 corresponds to uv.y=1.
 
-### Texture pixel → line + column
+### Texture pixel → row → column
 
-For the line, it's pure division:
+Because the painter already built a flat list of `visualRows` this
+frame (with each row knowing its `startDocPos`), we don't have to
+think about logical lines at all here:
 
 ```js
-const row = Math.floor((py - PADDING) / LINE_HEIGHT);
-const lineNumber = clamp(scrollTopLine + 1 + row, 1, doc.lines);
+const rowIdx = clamp(scrollTopRow + Math.floor((py - PADDING) / LINE_HEIGHT),
+                     0, visualRows.length - 1);
+const row = visualRows[rowIdx];
 ```
 
-`scrollTopLine` is the same viewport offset the painter used.
-
-For the column, we reuse the painter's per-line font logic so the math
-stays consistent:
+That's it for "which row." For the column within that row, we reuse
+the painter's per-row font logic (`setFont(row.style)`) so the
+measurements match exactly what was drawn:
 
 ```js
-setFont(lineStyle(line.text));
+setFont(row.style);
 const targetX = Math.max(0, px - PADDING);
-let col = line.text.length;
+let col = row.text.length;
 let prevW = 0;
-for (let i = 1; i <= line.text.length; i++) {
-  const w = tctx.measureText(line.text.slice(0, i)).width;
+for (let i = 1; i <= row.text.length; i++) {
+  const w = tctx.measureText(row.text.slice(0, i)).width;
   if (targetX < (prevW + w) / 2) { col = i - 1; break; }
   prevW = w;
 }
@@ -449,19 +572,22 @@ The `(prevW + w) / 2` is the midpoint between the left and right
 edges of the i-th glyph — the standard "snap to whichever side of the
 character you clicked on" behaviour all text editors use.
 
-This is O(n²) in the line length (each `measureText` call walks the
+This is O(n²) in the row length (each `measureText` call walks the
 substring) and could be O(n) by stepping one glyph at a time. For
-demo-sized lines it doesn't matter; for novel-sized lines you'd want
+demo-sized rows it doesn't matter; for novel-sized rows you'd want
 to cache cumulative widths.
 
 ### Dispatching back into CodeMirror
 
 ```js
+const pos = row.startDocPos + col;
 view.dispatch({ selection: { anchor: pos, head: pos } });
 ```
 
-That's the entire act of moving the caret. `pos` is an absolute
-document offset; `line.from + col` produces it.
+That's the entire act of moving the caret. The `startDocPos` we
+stashed on every row earlier is exactly the bridge from visual
+coordinates back to CodeMirror's flat document offsets — no extra
+mapping table required.
 
 ### Drag selection
 
@@ -497,22 +623,25 @@ drag that goes off the edge doesn't end abruptly.
 This demo stops at "good enough to feel real." A short list of where
 to go from here:
 
-- **CPU-side displacement for accurate hit testing.** Run `baseWarp`
-  in JS and either ray-march the heightfield or update a copy of the
-  geometry's positions each frame; raycast against that. The shader
-  becomes the source of truth for both rendering and hit-testing.
-- **Wrapped lines.** CodeMirror handles wrapping; the painter
-  doesn't. To match, either enable `EditorView.lineWrapping` and ask
-  CodeMirror for its visual line layout, or implement greedy wrapping
-  in the painter with the same line height.
+- **CPU-side displacement for accurate hit testing.** Run the same
+  `warp()` function in JS and either ray-march the heightfield or
+  update a copy of the geometry's positions each frame; raycast
+  against that. The shader becomes the source of truth for both
+  rendering and hit-testing.
 - **Syntax-aware highlighting.** Right now we regex-match the first
   characters of each line. CodeMirror exposes a syntax tree via
   `syntaxTree(view.state)` you can walk to highlight `**bold**` runs,
-  inline `code`, links, etc.
+  inline `code`, links, etc. — would also let you assign per-token
+  colours (a darker brown for emphasis, a sepia for code) without
+  much extra code.
 - **Real lighting.** Compute a normal from the warp's analytical
   derivatives (or via screen-space derivatives in the fragment
   shader) and do a basic Lambert. The "ridges brighter" trick will
   start to feel cheap once everything else is real.
+- **Smarter wrap.** The wrap is greedy and word-based; long
+  unbreakable tokens (a URL, a path with no spaces) will overflow.
+  Knuth–Plass-style penalty wrapping or character-level fallback
+  would handle them.
 - **Multi-cursor.** CodeMirror supports it natively
   (`state.selection.ranges`); the painter only renders
   `selection.main`.
