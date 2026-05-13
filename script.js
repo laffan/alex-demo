@@ -240,7 +240,7 @@ const camera = new THREE.PerspectiveCamera(
   0.1,
   100,
 );
-camera.position.set(0, 0, 4.2);
+camera.position.set(0, 0, 4.8);
 
 const texture = new THREE.CanvasTexture(texCanvas);
 texture.minFilter = THREE.LinearFilter;
