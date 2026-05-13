@@ -1,0 +1,55 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+  color: #fff;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  cursor: text;
+  outline: none;
+}
+
+/* The CodeMirror instance lives here, off-screen.
+   It owns all keyboard input, selection state, history, etc.
+   We paint a stylised copy of its document onto a 2D canvas each frame
+   and that canvas becomes the WebGL texture. */
+#editor-host {
+  position: fixed;
+  top: 0;
+  left: -20000px;
+  width: 1200px;
+  height: 1600px;
+  pointer-events: none;
+  opacity: 0;
+}
+
+#hint {
+  position: fixed;
+  bottom: 18px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  opacity: 0.45;
+  pointer-events: none;
+  mix-blend-mode: difference;
+  z-index: 10;
+}
