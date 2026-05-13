@@ -34,7 +34,7 @@ const tctx = texCanvas.getContext("2d");
 
 const FONT_SIZE = 100;
 const LINE_HEIGHT = 118;
-const PADDING = 80;
+const PADDING = 240;
 const FONT_FAMILY = '"Trocchi", Georgia, serif';
 
 let cursorBlink = true;
@@ -205,9 +205,17 @@ function renderTexture() {
         Math.max(0, head - row.startDocPos),
         row.text.length,
       );
-      const w = tctx.measureText(row.text.slice(0, localCol)).width;
+      const wBefore = tctx.measureText(row.text.slice(0, localCol)).width;
+      const cursorChar = localCol < row.text.length ? row.text[localCol] : "";
+      const blockWidth = cursorChar
+        ? tctx.measureText(cursorChar).width
+        : tctx.measureText("M").width * 0.55;
       tctx.fillStyle = FG_HEX;
-      tctx.fillRect(PADDING + w, y + 6, 6, s.size - 4);
+      tctx.fillRect(PADDING + wBefore, y + 6, blockWidth, s.size - 4);
+      if (cursorChar) {
+        tctx.fillStyle = BG_HEX;
+        tctx.fillText(cursorChar, PADDING + wBefore, baseline);
+      }
     }
 
     y += LINE_HEIGHT;
@@ -357,22 +365,35 @@ let dragAnchor = 0;
 
 const stageEl = document.getElementById("stage");
 
+// preventDefault on pointerdown stops the browser from running its
+// default mousedown side effects — most importantly, collapsing any
+// active text selection inside the (focused but not clicked)
+// contenteditable. Combined with focusing the editor *before* we
+// dispatch the selection, this keeps state.selection and the DOM
+// Selection in lockstep, so CodeMirror commands like Delete see the
+// range we drew rather than a collapsed cursor.
 stageEl.addEventListener("pointerdown", (e) => {
-  const pos = docPosFromPointer(e);
-  if (pos !== null) {
-    dragAnchor = pos;
-    dragging = true;
-    stageEl.setPointerCapture(e.pointerId);
-    view.dispatch({ selection: { anchor: pos, head: pos } });
-  }
+  e.preventDefault();
   view.focus();
+  const pos = docPosFromPointer(e);
+  if (pos === null) return;
+  dragAnchor = pos;
+  dragging = true;
+  stageEl.setPointerCapture(e.pointerId);
+  view.dispatch({
+    selection: { anchor: pos, head: pos },
+    userEvent: "select.pointer",
+  });
 });
 
 stageEl.addEventListener("pointermove", (e) => {
   if (!dragging) return;
   const pos = docPosFromPointer(e);
   if (pos === null) return;
-  view.dispatch({ selection: { anchor: dragAnchor, head: pos } });
+  view.dispatch({
+    selection: { anchor: dragAnchor, head: pos },
+    userEvent: "select.pointer",
+  });
 });
 
 function endDrag(e) {
@@ -381,6 +402,11 @@ function endDrag(e) {
   try {
     stageEl.releasePointerCapture(e.pointerId);
   } catch {}
+  // Re-focus so CodeMirror re-syncs the contenteditable's DOM Selection
+  // to state.selection. Without this, the DOM Selection can lag behind
+  // the dispatched range and the next keystroke acts on a collapsed
+  // cursor.
+  view.focus();
 }
 stageEl.addEventListener("pointerup", endDrag);
 stageEl.addEventListener("pointercancel", endDrag);

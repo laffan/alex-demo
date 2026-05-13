@@ -263,18 +263,41 @@ actually appear. Same convention every editor uses.
 ### The caret
 
 `tctx.measureText()` is the single most useful 2D-canvas API for this
-whole project. To draw the caret, given the cursor row and the local
-column within it:
+whole project. The caret is a terminal-style **block cursor**:
 
 ```js
 const localCol = head - row.startDocPos;
-const w = tctx.measureText(row.text.slice(0, localCol)).width;
-tctx.fillRect(PADDING + w, y + 6, 6, s.size - 4);
+const wBefore = tctx.measureText(row.text.slice(0, localCol)).width;
+const cursorChar = localCol < row.text.length ? row.text[localCol] : "";
+const blockWidth = cursorChar
+  ? tctx.measureText(cursorChar).width
+  : tctx.measureText("M").width * 0.55;        // end-of-row fallback
+
+tctx.fillStyle = FG_HEX;
+tctx.fillRect(PADDING + wBefore, y + 6, blockWidth, s.size - 4);
+if (cursorChar) {
+  tctx.fillStyle = BG_HEX;
+  tctx.fillText(cursorChar, PADDING + wBefore, baseline);
+}
 ```
 
-Measure the substring before the caret, draw a 6px-wide rectangle in
-the foreground colour. A `setInterval` flips a `cursorBlink` flag
-every 530ms so it blinks in the OS-conventional rhythm.
+Three things to notice:
+
+- **The block width matches the glyph under it.** We measure the
+  character at the caret's position so the block is exactly as wide
+  as the letter it covers — narrow on an `i`, fat on an `m`. At the
+  end of a row (or at end-of-doc) there's no character to measure,
+  so we fall back to about half an em.
+- **The character under the block gets redrawn inverted.** The
+  regular `fillText(row.text, ...)` call has already painted the
+  whole row in the foreground colour. Drawing a foreground-coloured
+  block on top covers that letter; drawing it again in the background
+  colour at the same position gives the classic inverted-glyph block
+  cursor effect.
+- **It still blinks.** A `setInterval` flips a `cursorBlink` flag
+  every 530ms. When the flag is off, the block isn't drawn at all,
+  and the original letter (drawn in the regular `fillText` pass
+  earlier) shows through.
 
 ### Selection ranges
 
@@ -589,32 +612,80 @@ stashed on every row earlier is exactly the bridge from visual
 coordinates back to CodeMirror's flat document offsets — no extra
 mapping table required.
 
-### Drag selection
+### Drag selection (and the focus dance that makes it work)
 
-The drag implementation is conventional pointer-capture state:
+The drag itself is conventional pointer-capture state — `pointerdown`
+sets an anchor and a collapsed selection, `pointermove` extends the
+head, `pointerup` ends it. `setPointerCapture` is the unsung hero
+here: it guarantees pointermove events keep arriving even when the
+cursor leaves the window, so a drag that goes off the edge doesn't
+end abruptly.
+
+The non-obvious part is *focus and DOM selection synchronisation*.
+The first version of this demo had a subtle bug: drag a selection,
+press Delete, and only one character got deleted — as if the
+selection wasn't there at all, even though the painter had clearly
+drawn it. Three things go wrong if you don't actively manage focus:
+
+1. **`mousedown` on the canvas runs its default action.** Among other
+   things, the browser will collapse any active text selection on the
+   page. The contenteditable inside `#editor-host` is hidden but
+   technically a normal text element, and its DOM `Selection` is
+   subject to the same rules. By the time we dispatch our drag
+   selection, the underlying DOM Selection has just been collapsed.
+2. **CodeMirror's DOM selection sync is conditional on focus.** When
+   you call `view.dispatch({ selection })`, CodeMirror updates
+   `state.selection` immediately and tries to update the contenteditable's
+   DOM Selection to match. But if focus has wandered (or never arrived
+   at) the editor, the DOM Selection update can no-op.
+3. **CodeMirror's `selectionchange` handler reads from the DOM.** On
+   the next user key event, CodeMirror checks whether the DOM
+   Selection matches `state.selection`. If they disagree, it can
+   "correct" `state.selection` to match what's actually in the DOM —
+   which, in our broken case, is a collapsed cursor. The keymap then
+   sees a collapsed selection and Delete eats just one character.
+
+Four small changes fix the whole chain:
 
 ```js
 stageEl.addEventListener("pointerdown", (e) => {
+  e.preventDefault();              // 1
+  view.focus();                    // 2
   const pos = docPosFromPointer(e);
-  if (pos !== null) {
-    dragAnchor = pos;
-    dragging = true;
-    stageEl.setPointerCapture(e.pointerId);
-    view.dispatch({ selection: { anchor: pos, head: pos } });
-  }
-  view.focus();
+  if (pos === null) return;
+  dragAnchor = pos;
+  dragging = true;
+  stageEl.setPointerCapture(e.pointerId);
+  view.dispatch({                  // 3
+    selection: { anchor: pos, head: pos },
+    userEvent: "select.pointer",
+  });
 });
 
-stageEl.addEventListener("pointermove", (e) => {
-  if (!dragging) return;
-  const pos = docPosFromPointer(e);
-  if (pos !== null) view.dispatch({ selection: { anchor: dragAnchor, head: pos } });
-});
+// pointerup:
+view.focus();                      // 4
 ```
 
-`setPointerCapture` is the unsung hero. It guarantees pointermove
-events keep arriving even when the cursor leaves the window, so a
-drag that goes off the edge doesn't end abruptly.
+1. **`preventDefault()` on `pointerdown`** stops the browser's default
+   mousedown side effects — no selection collapse, no focus change.
+   In the pointer events model, this also suppresses the synthetic
+   mousedown that would otherwise follow.
+2. **`view.focus()` before any dispatch** guarantees CodeMirror owns
+   focus by the time we ask it to update its selection, so the DOM
+   Selection sync actually runs.
+3. **`userEvent: "select.pointer"`** tags the transaction so anything
+   CodeMirror does (history grouping, plugins listening for
+   selection changes) treats it as a user-initiated drag rather than
+   a programmatic poke.
+4. **`view.focus()` again on `pointerup`** re-asserts the DOM
+   Selection sync after the drag ends, so the very next keystroke
+   sees the range we drew.
+
+The canvas's `tabindex` attribute is also gone (it was `0` originally
+to make the canvas focusable for click-to-type). Without it, a click
+on the canvas can't accidentally pull focus off the editor in the
+first place, which is one less thing for the focus dance to recover
+from.
 
 ---
 
