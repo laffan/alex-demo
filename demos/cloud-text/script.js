@@ -37,15 +37,15 @@ view.focus();
 //    grows to match. Selection and cursor still get their own paint
 //    colours so the shader can recover them from RGB alone.
 // ------------------------------------------------------------------
-const TEX = 3072;
+const TEX = 2048;
 const texCanvas = document.createElement("canvas");
 texCanvas.width = TEX;
 texCanvas.height = TEX;
 const tctx = texCanvas.getContext("2d");
 
-const FONT_SIZE = 280;
-const LINE_HEIGHT = 340;
-const PADDING = 240;
+const FONT_SIZE = 160;
+const LINE_HEIGHT = 200;
+const PADDING = 160;
 const FONT_FAMILY = '"Archivo Black", "Inter", sans-serif';
 
 let cursorBlink = true;
@@ -175,7 +175,7 @@ function renderTexture() {
 
     if (s.bar && row.isFirstInLine) {
       tctx.fillStyle = TEXT_HEX;
-      tctx.fillRect(PADDING - 70, y + 20, 22, s.size - 40);
+      tctx.fillRect(PADDING - 40, y + 12, 14, s.size - 24);
     }
 
     if (hasRange && selTo > row.startDocPos && selFrom <= row.endDocPos) {
@@ -253,16 +253,26 @@ const vertexShader = /* glsl */ `
   }
 `;
 
-// Volumetric pass, lean version. The slab is *thin* and the
-// "fluff" comes from a 2D fbm sampled per slice with z baked into
-// translation, which is roughly half the cost of a true 3D fbm and
-// looks indistinguishable on a slab this shallow.
+// Volumetric pass, lean version. The march itself is only 8 steps
+// — the visible "fluff" comes from two things:
 //
-// The big win is `densityProbe`: a 5-tap lookup into the unwarped
-// text texture in a small neighbourhood. If none of those taps see
-// any text, we know no warp could possibly pull text into this
-// fragment and we exit immediately as sky. On a typical screen the
-// vast majority of fragments take that branch.
+//   1) A per-pixel stochastic jitter on the march start. Without
+//      this, an 8-step march reads as 8 concentric ridges around
+//      each glyph (visible banding). With it, neighbouring pixels
+//      sample slightly different z values along the slab, and the
+//      banding turns into film-grain-like softness that integrates
+//      to a soft volume over a few pixels of TAA-less screen-space
+//      blur.
+//
+//   2) Coarse, low-frequency 2D fbm — one octave for shape, one
+//      higher-frequency octave at half amplitude for grain. With z
+//      baked into the noise translation, every slice has its own
+//      cloud pattern but neighbouring slices stay correlated.
+//
+// The 5-tap density probe survives because it's still the biggest
+// win: on a typical screen the empty-sky pixels (which is most of
+// the screen now that the camera is zoomed out) skip the march
+// entirely.
 const fragmentShader = /* glsl */ `
   precision highp float;
 
@@ -270,6 +280,7 @@ const fragmentShader = /* glsl */ `
   uniform float uTime;
   uniform vec2 uOrigin;     // atlas UV the camera is centred on
   uniform vec2 uViewSize;   // fraction of atlas the screen shows
+  uniform vec2 uRes;
   varying vec2 vUv;
 
   float hash12(vec2 p) {
@@ -289,9 +300,7 @@ const fragmentShader = /* glsl */ `
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
   }
 
-  // 2-octave fbm. The shape we need ("clumpy with some detail")
-  // doesn't justify more — extra octaves just shrink the dynamic
-  // range and add cost.
+  // 2-octave fbm.
   float fbm2(vec2 p) {
     return vnoise(p) * 0.65 + vnoise(p * 2.0 + 11.3) * 0.35;
   }
@@ -303,17 +312,13 @@ const fragmentShader = /* glsl */ `
     return mix(deep, lift, g * 0.65);
   }
 
-  // Pre-check: peek at the unwarped atlas in a small neighbourhood.
-  // Returns the max "anything there?" signal — combined glyph and
-  // selection density. If this is essentially zero, no warp can
-  // pull text into this fragment, so the march is unnecessary.
   float densityProbe(vec2 atlasUv) {
     float r = 0.0;
     vec4 t0 = texture2D(uTex, atlasUv);
-    vec4 t1 = texture2D(uTex, atlasUv + vec2( 0.045, 0.0));
-    vec4 t2 = texture2D(uTex, atlasUv + vec2(-0.045, 0.0));
-    vec4 t3 = texture2D(uTex, atlasUv + vec2(0.0,  0.045));
-    vec4 t4 = texture2D(uTex, atlasUv + vec2(0.0, -0.045));
+    vec4 t1 = texture2D(uTex, atlasUv + vec2( 0.060, 0.0));
+    vec4 t2 = texture2D(uTex, atlasUv + vec2(-0.060, 0.0));
+    vec4 t3 = texture2D(uTex, atlasUv + vec2(0.0,  0.060));
+    vec4 t4 = texture2D(uTex, atlasUv + vec2(0.0, -0.060));
     r = max(r, max(t0.r, t0.b));
     r = max(r, max(t1.r, t1.b));
     r = max(r, max(t2.r, t2.b));
@@ -323,17 +328,10 @@ const fragmentShader = /* glsl */ `
   }
 
   void main() {
-    // Pan + zoom: vUv covers the whole screen, atlasUv is the
-    // sub-window of the text canvas we're actually showing.
     vec2 atlasUv = uOrigin + (vUv - 0.5) * uViewSize;
 
-    // Aspect-correct uv that matches a square atlas region — used by
-    // the noise so fbm cells are square in atlas space, not stretched.
-    vec2 nUv = atlasUv;
-
     float probe = densityProbe(atlasUv);
-    if (probe < 0.02) {
-      // Pure sky — skip the entire march.
+    if (probe < 0.03) {
       vec3 col = sky(vUv);
       float vig = smoothstep(1.15, 0.2, length(vUv - 0.5));
       col *= 0.78 + 0.22 * vig;
@@ -341,44 +339,51 @@ const fragmentShader = /* glsl */ `
       return;
     }
 
-    const int STEPS = 12;
-    float zNear = -0.45;
-    float zFar  =  0.45;
+    const int STEPS = 8;
+    float zNear = -0.50;
+    float zFar  =  0.50;
     float dz = (zFar - zNear) / float(STEPS);
+
+    // Per-pixel jitter on the march phase. This is the line that
+    // does the heavy lifting against banding: with it, an 8-step
+    // march reads as soft volume; without it, it reads as 8 layered
+    // posters.
+    float jitter = hash12(gl_FragCoord.xy + uTime * 60.0);
 
     vec3 emit = vec3(0.0);
     float trans = 1.0;
 
     for (int s = 0; s < STEPS; s++) {
-      float t = (float(s) + 0.5) / float(STEPS);
+      float t = (float(s) + jitter) / float(STEPS);
       float z = mix(zNear, zFar, t);
 
-      // 2D fbm with z and time baked into translation: cheap, looks
-      // identical on a slab this thin.
-      vec2 np = nUv * 4.0 + vec2(z * 1.2, uTime * 0.10);
+      // Lower-frequency noise than before: clouds clump softer.
+      vec2 np = atlasUv * 3.0 + vec2(z * 1.4, uTime * 0.08);
       float n  = fbm2(np);
-      float n2 = fbm2(np * 1.6 + 19.7);
+      float n2 = fbm2(np * 1.7 + 19.7);
 
-      // UV warp magnitude grows with |z| so glyph fronts/backs fray.
-      vec2 wuv = atlasUv + (vec2(n, n2) - 0.5) * (0.020 + 0.060 * abs(z));
+      // UV warp magnitude grows with |z|. The base value is small
+      // so unwarped text still anchors the eye; the |z| term frays
+      // the front and back.
+      vec2 wuv = atlasUv + (vec2(n, n2) - 0.5) * (0.018 + 0.075 * abs(z));
       vec4 texel = texture2D(uTex, wuv);
 
       float glyph = texel.r;
       float seln  = clamp(texel.b - texel.r * 0.6, 0.0, 1.0);
 
-      float window = exp(-z * z * 11.0);
-      float dens = (glyph * 0.95 + seln * 0.65) * window * (0.5 + 0.85 * n);
+      // Softer z window — extends the cloud further along z than
+      // before, so glyphs read as "haze around a shape" instead of
+      // "thin sheet of paint".
+      float window = exp(-z * z * 7.0);
+      float dens = (glyph * 1.05 + seln * 0.75) * window * (0.45 + 0.95 * n);
 
       vec3 textCol = vec3(0.95, 0.92, 0.82);
       vec3 selCol  = vec3(0.55, 0.72, 1.25);
       vec3 sliceEmit = mix(textCol, selCol, clamp(seln * 1.4, 0.0, 1.0));
-
-      // Cheap depth shading: front-of-slab glows brighter. No second
-      // raymarch, no normal estimation — just a t-driven lerp.
       sliceEmit *= mix(0.55, 1.05, t);
 
-      emit  += trans * sliceEmit * dens * dz * 4.0;
-      trans *= exp(-dens * dz * 5.5);
+      emit  += trans * sliceEmit * dens * dz * 4.4;
+      trans *= exp(-dens * dz * 5.2);
 
       if (trans < 0.02) break;
     }
