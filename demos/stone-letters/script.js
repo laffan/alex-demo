@@ -3,44 +3,37 @@ import { markdown } from "https://esm.sh/@codemirror/lang-markdown@6.2.4";
 import * as THREE from "https://esm.sh/three@0.160.0";
 
 // ------------------------------------------------------------------
-// 0. Palette — earthen and dry.
+// 0. Palette.
 // ------------------------------------------------------------------
 const SKY_TOP_HEX = "#c9b58a";
 const SKY_BOTTOM_HEX = "#8d7848";
 const GROUND_HEX = "#b9a376";
 
-// Channel-encoded colours painted into the sampling canvas. The
-// instancer reads these back as three category masks: text (dark),
-// selection (red), cursor (yellow).
-const PAINT_TEXT = "#101010";
-const PAINT_SELECT = "#c8341d";
-const PAINT_CURSOR = "#f4c020";
-
-// Stone colours per category — tinted toward warm light from above.
 const STONE_TEXT_BASE = new THREE.Color("#3a2f24");
-const STONE_TEXT_HILITE = new THREE.Color("#766049");
+const STONE_TEXT_HI = new THREE.Color("#7a6249");
 const STONE_SELECT_BASE = new THREE.Color("#a23a17");
-const STONE_SELECT_HILITE = new THREE.Color("#dd6a2c");
-const STONE_CURSOR_BASE = new THREE.Color("#f6c64a");
-const STONE_CURSOR_HILITE = new THREE.Color("#fff3b8");
+const STONE_SELECT_HI = new THREE.Color("#dd6a2c");
+const STONE_CURSOR_BASE = new THREE.Color("#f5b630");
+const STONE_CURSOR_HI = new THREE.Color("#fff0a8");
 
 // ------------------------------------------------------------------
-// 1. Hidden CodeMirror 6 editor.
+// 1. Hidden CodeMirror 6 editor. Stones live in world space and are
+//    keyed by `${docPos}:${glyphStoneIdx}`; when the doc changes we
+//    remap docPos through the change set so existing stones glide to
+//    their new homes instead of cascading.
 // ------------------------------------------------------------------
+let stoneState = new Map();
+let dirty = true;
+
 const initialDoc = `STONES
 
-Every letter you type is built
-out of small pebbles, instanced
-from the rasterised shape of the
-glyph itself.
+each letter you type is built
+out of small stones, sampled
+from the rasterised shape of
+the glyph itself.
 
-# A heading is louder.
-> A quote is bracketed.`;
-
-// `dirty` gates the (relatively expensive) ImageData read + stone
-// rebuild. Anything that changes the picture — typing, selection
-// move, cursor blink, scroll — flips it true.
-let dirty = true;
+type — they fall in.
+delete — they tumble off.`;
 
 const view = new EditorView({
   doc: initialDoc,
@@ -48,7 +41,36 @@ const view = new EditorView({
     basicSetup,
     markdown(),
     EditorView.updateListener.of((u) => {
-      if (u.docChanged || u.selectionSet) dirty = true;
+      if (u.docChanged) {
+        // Walk the change set so each stone's char identity follows
+        // its character through inserts/deletes. Without this, any
+        // mid-document edit would re-key every following stone and
+        // the whole tail of the document would respawn.
+        const next = new Map();
+        for (const [key, stone] of stoneState) {
+          const colon = key.indexOf(":");
+          const head = key.slice(0, colon);
+          if (head === "cursor" || head === "orphan") {
+            next.set(key, stone);
+            continue;
+          }
+          const oldPos = parseInt(head, 10);
+          const newPos = u.changes.mapPos(oldPos, 1);
+          const newKey = `${newPos}:${key.slice(colon + 1)}`;
+          if (next.has(newKey)) {
+            // Collision: the character at oldPos was deleted and is
+            // colliding with a survivor. Push this stone into the
+            // dying pool with a unique key so it falls cleanly.
+            stone.dying = true;
+            next.set("orphan:" + Math.random().toString(36).slice(2), stone);
+          } else {
+            next.set(newKey, stone);
+          }
+        }
+        stoneState = next;
+        dirty = true;
+      }
+      if (u.selectionSet) dirty = true;
     }),
   ],
   parent: document.getElementById("editor-host"),
@@ -57,51 +79,25 @@ const view = new EditorView({
 view.focus();
 
 // ------------------------------------------------------------------
-// 2. Sampling canvas — small enough to ImageData every frame, large
-//    enough that thick glyph strokes get a few stones across them.
-//    We render with three flat colours; the instancer turns each
-//    colour into a stone tint.
+// 2. Layout-measurement canvas. We never actually rasterise the doc
+//    here — we only need measureText for word wrap and per-character
+//    advance. Glyph *pixels* come from the per-character cache below.
 // ------------------------------------------------------------------
 const TEX = 1024;
-const STRIDE = 7; // pixels between candidate stone positions
-const texCanvas = document.createElement("canvas");
-texCanvas.width = TEX;
-texCanvas.height = TEX;
-const tctx = texCanvas.getContext("2d", { willReadFrequently: true });
-
-const FONT_SIZE = 78;
-const LINE_HEIGHT = 96;
+const FONT_SIZE = 100;
+const LINE_HEIGHT = 134;
 const PADDING = 80;
-const FONT_FAMILY = '"Bowlby One", "Inter", sans-serif';
+const FONT_FAMILY = '"Bowlby One", sans-serif';
 
-let cursorBlink = true;
-setInterval(() => {
-  cursorBlink = !cursorBlink;
-  dirty = true;
-}, 530);
+const layoutCanvas = document.createElement("canvas");
+layoutCanvas.width = TEX;
+layoutCanvas.height = TEX;
+const lctx = layoutCanvas.getContext("2d");
+lctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+lctx.textBaseline = "alphabetic";
 
-let scrollTopRow = 0;
 let visualRows = [];
-
-function lineStyle(text) {
-  const h = /^(#{1,6})\s+/.exec(text);
-  if (h) {
-    const level = h[1].length;
-    return {
-      size: Math.max(FONT_SIZE - (level - 1) * 8, FONT_SIZE - 24),
-      bar: false,
-      heading: true,
-    };
-  }
-  if (/^>\s?/.test(text)) {
-    return { size: FONT_SIZE, bar: true, heading: false };
-  }
-  return { size: FONT_SIZE, bar: false, heading: false };
-}
-
-function setFont(s) {
-  tctx.font = `${s.size}px ${FONT_FAMILY}`;
-}
+let scrollTopRow = 0;
 
 function wrapText(text, maxWidth) {
   if (text.length === 0) return [{ text: "", startCol: 0 }];
@@ -112,7 +108,7 @@ function wrapText(text, maxWidth) {
   let pos = 0;
   for (const tok of tokens) {
     const test = segText + tok;
-    if (tctx.measureText(test).width > maxWidth && segText.length > 0) {
+    if (lctx.measureText(test).width > maxWidth && segText.length > 0) {
       segs.push({ text: segText, startCol: segStart });
       segStart = pos;
       segText = tok;
@@ -133,8 +129,6 @@ function computeLayout() {
   const maxWidth = TEX - 2 * PADDING;
   for (let lineNum = 1; lineNum <= doc.lines; lineNum++) {
     const line = doc.line(lineNum);
-    const style = lineStyle(line.text);
-    setFont(style);
     const segs = wrapText(line.text, maxWidth);
     for (let i = 0; i < segs.length; i++) {
       const seg = segs[i];
@@ -143,7 +137,6 @@ function computeLayout() {
         text: seg.text,
         startDocPos,
         endDocPos: startDocPos + seg.text.length,
-        style,
         isFirstInLine: i === 0,
         isLastInLine: i === segs.length - 1,
       });
@@ -162,81 +155,30 @@ function findCursorRow(rows, head) {
   return best;
 }
 
-function renderTexture() {
-  tctx.fillStyle = "#ffffff";
-  tctx.fillRect(0, 0, TEX, TEX);
+// ------------------------------------------------------------------
+// 3. Per-character glyph cache.
+//
+//    For each unique character we render the glyph once into a small
+//    canvas, then walk it on a jittered grid: each grid cell that
+//    contains an opaque pixel becomes one stone offset (with stable
+//    randomised scale, rotation, and tone). The stone cluster is
+//    keyed by the glyph's pixel shape, which is what makes a "B"
+//    look like a B and an "O" like an O.
+//
+//    The cache is keyed by character only — a Bowlby-One "a" is
+//    always the same shape, so the same offsets work everywhere it
+//    appears in the document. Per-instance variation comes from the
+//    docPos prefix on the stone key, not from the glyph cache.
+// ------------------------------------------------------------------
+const CACHE = 256;
+const cacheCanvas = document.createElement("canvas");
+cacheCanvas.width = CACHE;
+cacheCanvas.height = CACHE;
+const cctx = cacheCanvas.getContext("2d", { willReadFrequently: true });
 
-  visualRows = computeLayout();
-
-  const sel = view.state.selection.main;
-  const head = sel.head;
-  const selFrom = Math.min(sel.from, sel.to);
-  const selTo = Math.max(sel.from, sel.to);
-  const hasRange = selFrom !== selTo;
-
-  const cursorRowIdx = findCursorRow(visualRows, head);
-  const visibleRowCount = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
-
-  if (cursorRowIdx < scrollTopRow) scrollTopRow = cursorRowIdx;
-  if (cursorRowIdx >= scrollTopRow + visibleRowCount)
-    scrollTopRow = cursorRowIdx - visibleRowCount + 1;
-  if (scrollTopRow < 0) scrollTopRow = 0;
-
-  tctx.textBaseline = "alphabetic";
-
-  let y = PADDING;
-  for (let r = scrollTopRow; r < visualRows.length; r++) {
-    const row = visualRows[r];
-    const s = row.style;
-    setFont(s);
-    const baseline = y + s.size * 0.85;
-
-    if (s.bar && row.isFirstInLine) {
-      tctx.fillStyle = PAINT_TEXT;
-      tctx.fillRect(PADDING - 22, y + 8, 8, s.size - 16);
-    }
-
-    // Walk the row character-by-character so each glyph can be
-    // painted in either the text or selection colour depending on
-    // whether its doc position is inside the active range. The
-    // resulting canvas is what the instancer samples — no separate
-    // selection bookkeeping is needed downstream.
-    let x = PADDING;
-    for (let i = 0; i < row.text.length; i++) {
-      const ch = row.text[i];
-      const docPos = row.startDocPos + i;
-      const inSel = hasRange && docPos >= selFrom && docPos < selTo;
-      tctx.fillStyle = inSel ? PAINT_SELECT : PAINT_TEXT;
-      tctx.fillText(ch, x, baseline);
-      x += tctx.measureText(ch).width;
-    }
-
-    // Cursor: a flat block painted in the cursor-category colour. The
-    // instancer will lift it into a small pile of glowing pebbles.
-    if (r === cursorRowIdx && cursorBlink) {
-      const localCol = Math.min(
-        Math.max(0, head - row.startDocPos),
-        row.text.length,
-      );
-      const wBefore = tctx.measureText(row.text.slice(0, localCol)).width;
-      const cursorChar = localCol < row.text.length ? row.text[localCol] : "";
-      const blockWidth = cursorChar
-        ? tctx.measureText(cursorChar).width
-        : tctx.measureText("M").width * 0.45;
-      tctx.fillStyle = PAINT_CURSOR;
-      tctx.fillRect(PADDING + wBefore, y + 6, blockWidth, s.size - 4);
-    }
-
-    y += LINE_HEIGHT;
-    if (y > TEX - PADDING) break;
-  }
+function pixelSeed(a, b) {
+  return ((a | 0) * 374761393) ^ ((b | 0) * 668265263);
 }
-
-// ------------------------------------------------------------------
-// 3. Stable per-pixel pseudo-random — keyed on (gx, gy) so each
-//    stone keeps the same scale, rotation, and jitter across frames.
-//    Without this, stones flicker as the canvas re-rasterises.
-// ------------------------------------------------------------------
 function rng(seed) {
   let s = seed >>> 0;
   return () => {
@@ -244,9 +186,58 @@ function rng(seed) {
     return s / 4294967296;
   };
 }
-function pixelSeed(gx, gy) {
-  // Cantor-pair-ish; cheap and collision-free for our grid sizes.
-  return (gx * 374761393) ^ (gy * 668265263);
+
+const glyphCache = new Map();
+const STRIDE = 5; // pixels between candidate stones in the cache canvas
+
+function getGlyph(ch) {
+  const cached = glyphCache.get(ch);
+  if (cached) return cached;
+
+  cctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+  cctx.textBaseline = "alphabetic";
+  const m = cctx.measureText(ch);
+  const advance = m.width;
+  const ascent = (m.actualBoundingBoxAscent || FONT_SIZE * 0.85) | 0;
+  const descent = (m.actualBoundingBoxDescent || FONT_SIZE * 0.25) | 0;
+
+  const w = Math.max(1, Math.ceil(m.actualBoundingBoxRight ?? advance) + 2);
+  const h = Math.max(1, ascent + descent + 2);
+
+  cctx.clearRect(0, 0, CACHE, CACHE);
+  cctx.fillStyle = "#000";
+  cctx.fillText(ch, 1, ascent + 1);
+
+  const img = cctx.getImageData(0, 0, w, h).data;
+
+  const stones = [];
+  let idx = 0;
+  for (let gy = 0; gy < h - 1; gy += STRIDE) {
+    for (let gx = 0; gx < w - 1; gx += STRIDE) {
+      const r = rng(pixelSeed(ch.charCodeAt(0) || 0, idx));
+      const jx = r();
+      const jy = r();
+      const px = Math.min(w - 1, (gx + jx * STRIDE) | 0);
+      const py = Math.min(h - 1, (gy + jy * STRIDE) | 0);
+      const i = (py * w + px) * 4;
+      const lit = img[i + 3] > 80 && img[i] + img[i + 1] + img[i + 2] < 250;
+      if (lit) {
+        stones.push({
+          x: px - 1, // canvas-pixel offset from glyph left
+          y: py - 1 - ascent, // canvas-pixel offset from baseline
+          scale: 0.55 + r() * 0.6,
+          rotX: (r() - 0.5) * 0.7,
+          rotY: (r() - 0.5) * 0.7,
+          rotZ: r() * Math.PI * 2,
+          colorT: r(),
+        });
+      }
+      idx++;
+    }
+  }
+  const entry = { advance, ascent, descent, stones };
+  glyphCache.set(ch, entry);
+  return entry;
 }
 
 // ------------------------------------------------------------------
@@ -262,9 +253,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(SKY_BOTTOM_HEX);
 scene.fog = new THREE.Fog(SKY_BOTTOM_HEX, 6, 14);
 
-// Subtle vertical gradient sky — a large dome lit by the hemisphere
-// light only, no shading, so it sits behind everything as a flat
-// gradient backdrop.
+// Sky dome.
 {
   const skyGeo = new THREE.SphereGeometry(40, 32, 16);
   const skyMat = new THREE.ShaderMaterial({
@@ -293,15 +282,10 @@ scene.fog = new THREE.Fog(SKY_BOTTOM_HEX, 6, 14);
   scene.add(new THREE.Mesh(skyGeo, skyMat));
 }
 
-// Plane that the stones sit on — also acts as the (invisible to the
-// user, present in the raycaster) hit-test surface for pointer input.
-// It's tilted slightly so we read it as a "table" rather than a
-// floor.
-const PAGE_WIDTH = 5.0;
-const PAGE_DEPTH = 5.0;
+// Tilted page. Stones sit on (and above) this plane.
+const PAGE_WIDTH = 5.4;
+const PAGE_DEPTH = 5.4;
 const pageGroup = new THREE.Group();
-// rotate the whole page so it lies almost flat but tipped toward the
-// camera; rotation.x = -1.05 rad ≈ 60° down from vertical.
 pageGroup.rotation.x = -1.05;
 pageGroup.position.set(0, 0.05, -0.4);
 scene.add(pageGroup);
@@ -315,8 +299,7 @@ const groundMat = new THREE.MeshStandardMaterial({
 const ground = new THREE.Mesh(groundGeo, groundMat);
 pageGroup.add(ground);
 
-// Lighting — warm key from above-right, cool fill from sky, soft
-// hemisphere wrap so the underside of each pebble is still readable.
+// Lights.
 scene.add(new THREE.HemisphereLight(SKY_TOP_HEX, GROUND_HEX, 0.55));
 {
   const key = new THREE.DirectionalLight(0xfff1c4, 1.25);
@@ -337,16 +320,17 @@ const camera = new THREE.PerspectiveCamera(
 camera.position.set(0, 1.55, 3.05);
 camera.lookAt(0, 0, -0.5);
 
-// ------------------------------------------------------------------
-// 5. InstancedMesh of stones. Capacity is fixed; per-frame we set the
-//    matrix and colour of every "live" stone and zero out the rest.
-// ------------------------------------------------------------------
-const MAX_STONES = 9000;
-const stoneGeo = new THREE.IcosahedronGeometry(1.0, 0);
-// Squish the icosahedron lightly along its local Y so the stones
-// read as pebbles, not perfect orbs.
-stoneGeo.scale(1.0, 0.78, 1.0);
+// Force pageGroup's matrixWorld to be current — we sample it below
+// when computing world-space stone homes from page-local positions.
+scene.updateMatrixWorld(true);
 
+// ------------------------------------------------------------------
+// 5. InstancedMesh of stones — one slot per live stone, regardless
+//    of which character they belong to.
+// ------------------------------------------------------------------
+const MAX_STONES = 12000;
+const stoneGeo = new THREE.IcosahedronGeometry(1.0, 0);
+stoneGeo.scale(1.0, 0.78, 1.0);
 const stoneMat = new THREE.MeshStandardMaterial({
   vertexColors: false,
   roughness: 0.85,
@@ -355,9 +339,7 @@ const stoneMat = new THREE.MeshStandardMaterial({
 const stones = new THREE.InstancedMesh(stoneGeo, stoneMat, MAX_STONES);
 stones.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 stones.count = 0;
-pageGroup.add(stones);
-
-// Pre-allocate the per-instance colour buffer.
+scene.add(stones); // lives in world space, NOT under pageGroup
 {
   const colors = new Float32Array(MAX_STONES * 3);
   stones.instanceColor = new THREE.InstancedBufferAttribute(colors, 3);
@@ -366,89 +348,236 @@ pageGroup.add(stones);
 
 const dummy = new THREE.Object3D();
 const dummyColor = new THREE.Color();
+
 const STONE_RADIUS = (PAGE_WIDTH / TEX) * STRIDE * 0.78;
+const SPAWN_LIFT = 0.9; // world units a new stone falls from
 
-// Each frame: walk the sampling canvas, place one stone per lit
-// pixel (with stable jitter), and update the InstancedMesh.
-function rebuildStones() {
-  const img = tctx.getImageData(0, 0, TEX, TEX).data;
+// Convert a (canvas-x, canvas-y, lift) page-local coord to world.
+const _scratch = new THREE.Vector3();
+function pageToWorld(canvasX, canvasY, lift, out) {
+  const u = canvasX / TEX;
+  const v = canvasY / TEX;
+  _scratch.set((u - 0.5) * PAGE_WIDTH, -(v - 0.5) * PAGE_DEPTH, lift);
+  _scratch.applyMatrix4(pageGroup.matrixWorld);
+  out.copy(_scratch);
+}
 
-  let count = 0;
-  for (let gy = STRIDE / 2; gy < TEX; gy += STRIDE) {
-    for (let gx = STRIDE / 2; gx < TEX; gx += STRIDE) {
-      const i = (gy * TEX + gx) * 4;
-      const r = img[i];
-      const g = img[i + 1];
-      const b = img[i + 2];
+// ------------------------------------------------------------------
+// 6. Compute the per-frame target list — one entry per stone that
+//    should currently exist. The stoneState map then matches these
+//    targets against existing stones (re-using identity), spawns new
+//    ones, and marks dropped ones as dying.
+// ------------------------------------------------------------------
+const targetHome = new THREE.Vector3();
 
-      // Quick classifier: very dark → text, red-dominant → selection,
-      // yellow-ish → cursor, else background (skip).
-      let category;
-      if (r < 90 && g < 90 && b < 90) {
-        category = 0; // text
-      } else if (r > 150 && g < 110 && b < 110) {
-        category = 1; // selection
-      } else if (r > 200 && g > 140 && b < 120) {
-        category = 2; // cursor
-      } else {
+function buildTargets(out) {
+  out.length = 0;
+
+  visualRows = computeLayout();
+
+  const sel = view.state.selection.main;
+  const head = sel.head;
+  const selFrom = Math.min(sel.from, sel.to);
+  const selTo = Math.max(sel.from, sel.to);
+  const hasRange = selFrom !== selTo;
+
+  const cursorRowIdx = findCursorRow(visualRows, head);
+  const visibleRowCount = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
+  if (cursorRowIdx < scrollTopRow) scrollTopRow = cursorRowIdx;
+  if (cursorRowIdx >= scrollTopRow + visibleRowCount)
+    scrollTopRow = cursorRowIdx - visibleRowCount + 1;
+  if (scrollTopRow < 0) scrollTopRow = 0;
+
+  let cursorCanvasX = PADDING;
+  let cursorCanvasY = PADDING;
+
+  let y = PADDING;
+  for (let r = scrollTopRow; r < visualRows.length; r++) {
+    const row = visualRows[r];
+    let x = PADDING;
+
+    for (let i = 0; i < row.text.length; i++) {
+      const ch = row.text[i];
+      const docPos = row.startDocPos + i;
+
+      if (ch === " " || ch === "\t") {
+        x += lctx.measureText(ch).width;
+        if (r === cursorRowIdx && docPos === head) {
+          cursorCanvasX = x;
+          cursorCanvasY = y + FONT_SIZE * 0.5;
+        }
         continue;
       }
 
-      if (count >= MAX_STONES) break;
+      const entry = getGlyph(ch);
+      const baseline = y + FONT_SIZE * 0.85;
+      const inSel = hasRange && docPos >= selFrom && docPos < selTo;
 
-      // World position from sampling-canvas coordinates.
-      const u = gx / TEX;
-      const v = gy / TEX;
-      const wx = (u - 0.5) * PAGE_WIDTH;
-      const wy = -(v - 0.5) * PAGE_DEPTH;
-
-      const seedR = rng(pixelSeed(gx, gy));
-      const jx = (seedR() - 0.5) * STONE_RADIUS * 1.4;
-      const jy = (seedR() - 0.5) * STONE_RADIUS * 1.4;
-      const scale = STONE_RADIUS * (0.55 + seedR() * 0.6);
-      const rotZ = seedR() * Math.PI * 2;
-      const rotX = (seedR() - 0.5) * 0.8;
-      const rotY = (seedR() - 0.5) * 0.8;
-      // Lift off the page by a small random amount so stones pile
-      // rather than tile.
-      const lift = scale * (0.4 + seedR() * 1.1);
-
-      dummy.position.set(wx + jx, wy + jy, lift);
-      dummy.rotation.set(rotX, rotY, rotZ);
-      dummy.scale.setScalar(scale);
-      dummy.updateMatrix();
-      stones.setMatrixAt(count, dummy.matrix);
-
-      // Colour: lerp between base and hilite per category by a stable
-      // hash so adjacent stones have visible tonal variation.
-      const t = seedR();
-      let base, hi;
-      if (category === 0) {
-        base = STONE_TEXT_BASE;
-        hi = STONE_TEXT_HILITE;
-      } else if (category === 1) {
-        base = STONE_SELECT_BASE;
-        hi = STONE_SELECT_HILITE;
-      } else {
-        base = STONE_CURSOR_BASE;
-        hi = STONE_CURSOR_HILITE;
+      if (r === cursorRowIdx && docPos === head) {
+        cursorCanvasX = x;
+        cursorCanvasY = y + FONT_SIZE * 0.5;
       }
-      dummyColor.copy(base).lerp(hi, t * 0.7);
-      stones.setColorAt(count, dummyColor);
 
-      count++;
+      for (let j = 0; j < entry.stones.length; j++) {
+        const st = entry.stones[j];
+        const cx = x + st.x;
+        const cy = baseline + st.y;
+        const lift = STONE_RADIUS * (0.4 + st.colorT * 1.0);
+        pageToWorld(cx, cy, lift, targetHome);
+
+        out.push({
+          key: `${docPos}:${j}`,
+          home: targetHome.clone(),
+          colorBase: inSel ? STONE_SELECT_BASE : STONE_TEXT_BASE,
+          colorHi: inSel ? STONE_SELECT_HI : STONE_TEXT_HI,
+          colorT: st.colorT,
+          scale: STONE_RADIUS * st.scale,
+          rotX: st.rotX,
+          rotY: st.rotY,
+          rotZ: st.rotZ,
+        });
+      }
+      x += entry.advance;
     }
-    if (count >= MAX_STONES) break;
+
+    if (r === cursorRowIdx && head >= row.endDocPos) {
+      cursorCanvasX = x;
+      cursorCanvasY = y + FONT_SIZE * 0.5;
+    }
+    y += LINE_HEIGHT;
+    if (y > TEX - PADDING) break;
   }
 
-  stones.count = count;
+  // Cursor: a small heap of bright stones at the caret position.
+  // Always present — no blink — because a blinking pile would be a
+  // distracting strobe. Pulse via a per-frame scale instead.
+  const CURSOR_STONE_COUNT = 9;
+  for (let i = 0; i < CURSOR_STONE_COUNT; i++) {
+    const r = rng(pixelSeed(2718281, i));
+    const jx = (r() - 0.5) * STONE_RADIUS * 1.6;
+    const jy = (r() - 0.5) * FONT_SIZE * 0.45;
+    const lift = STONE_RADIUS * (0.5 + r() * 1.2);
+    pageToWorld(cursorCanvasX + jx, cursorCanvasY + jy, lift, targetHome);
+    out.push({
+      key: `cursor:${i}`,
+      home: targetHome.clone(),
+      colorBase: STONE_CURSOR_BASE,
+      colorHi: STONE_CURSOR_HI,
+      colorT: r(),
+      scale: STONE_RADIUS * (0.7 + r() * 0.5),
+      rotX: (r() - 0.5) * 0.6,
+      rotY: (r() - 0.5) * 0.6,
+      rotZ: r() * Math.PI * 2,
+    });
+  }
+}
+
+// ------------------------------------------------------------------
+// 7. Match targets → existing stones; spawn / mark-dying as needed;
+//    integrate physics; write to InstancedMesh.
+// ------------------------------------------------------------------
+const SPRING_K = 36;
+const DAMP = 7.5;
+const GRAVITY = -9.8;
+const targets = [];
+const seenKeys = new Set();
+const _tmpVec = new THREE.Vector3();
+
+function step(dt) {
+  buildTargets(targets);
+
+  seenKeys.clear();
+  for (const t of targets) {
+    let s = stoneState.get(t.key);
+    if (!s) {
+      // New stone — spawn above its home with zero velocity. The
+      // spring will pull it down; damping will catch it.
+      s = {
+        pos: t.home.clone().add(_tmpVec.set(0, SPAWN_LIFT, 0)),
+        vel: new THREE.Vector3(),
+        home: t.home.clone(),
+        rotX: t.rotX,
+        rotY: t.rotY,
+        rotZ: t.rotZ,
+        scale: t.scale,
+        colorBase: t.colorBase,
+        colorHi: t.colorHi,
+        colorT: t.colorT,
+        dying: false,
+      };
+      stoneState.set(t.key, s);
+    } else {
+      s.home.copy(t.home);
+      s.colorBase = t.colorBase;
+      s.colorHi = t.colorHi;
+      s.scale = t.scale;
+      s.dying = false;
+    }
+    seenKeys.add(t.key);
+  }
+
+  // Anything not seen this frame is being deleted. Cut it loose from
+  // its spring; gravity will take it from there.
+  for (const [k, s] of stoneState) {
+    if (!seenKeys.has(k) && !s.dying) {
+      s.dying = true;
+      // a tiny outward kick so they tumble rather than just plummet
+      s.vel.x += (Math.random() - 0.5) * 0.6;
+      s.vel.z += (Math.random() - 0.5) * 0.6;
+      s.vel.y += 0.4 + Math.random() * 0.4;
+    }
+  }
+
+  // Integrate.
+  for (const [k, s] of stoneState) {
+    if (s.dying) {
+      s.vel.y += GRAVITY * dt;
+      s.pos.addScaledVector(s.vel, dt);
+      // tumble
+      s.rotX += s.vel.z * dt * 0.8;
+      s.rotZ += s.vel.x * dt * 0.8;
+      if (s.pos.y < -2.5) stoneState.delete(k);
+    } else {
+      const dx = s.home.x - s.pos.x;
+      const dy = s.home.y - s.pos.y;
+      const dz = s.home.z - s.pos.z;
+      s.vel.x += (SPRING_K * dx - DAMP * s.vel.x) * dt;
+      s.vel.y += (SPRING_K * dy - DAMP * s.vel.y) * dt;
+      s.vel.z += (SPRING_K * dz - DAMP * s.vel.z) * dt;
+      s.pos.addScaledVector(s.vel, dt);
+    }
+  }
+
+  // Write to InstancedMesh.
+  let i = 0;
+  const t = clock.getElapsedTime();
+  const cursorPulse = 1.0 + 0.18 * Math.sin(t * 4.5);
+  for (const [k, s] of stoneState) {
+    if (i >= MAX_STONES) break;
+    const isCursor = k.startsWith("cursor:");
+    const scaleMul = isCursor ? cursorPulse : 1.0;
+
+    dummy.position.copy(s.pos);
+    dummy.rotation.set(s.rotX, s.rotY, s.rotZ);
+    dummy.scale.setScalar(s.scale * scaleMul);
+    dummy.updateMatrix();
+    stones.setMatrixAt(i, dummy.matrix);
+
+    dummyColor.copy(s.colorBase).lerp(s.colorHi, s.colorT * 0.7);
+    if (s.dying) dummyColor.multiplyScalar(0.85);
+    stones.setColorAt(i, dummyColor);
+
+    i++;
+  }
+  stones.count = i;
   stones.instanceMatrix.needsUpdate = true;
   if (stones.instanceColor) stones.instanceColor.needsUpdate = true;
 }
 
 // ------------------------------------------------------------------
-// 6. Pointer → caret. We raycast the (same) ground plane, recover its
-//    UV, and walk visualRows the same way as in demo #01.
+// 8. Pointer hit testing — same routine as demo #01: raycast the
+//    page plane, get the UV, walk visualRows + measureText to recover
+//    a doc position. The stones themselves aren't hit-tested.
 // ------------------------------------------------------------------
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
@@ -472,12 +601,12 @@ function docPosFromPointer(event) {
   if (rowIdx >= visualRows.length) rowIdx = visualRows.length - 1;
   const row = visualRows[rowIdx];
 
-  setFont(row.style);
+  lctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
   const targetX = Math.max(0, px - PADDING);
   let col = row.text.length;
   let prevW = 0;
   for (let i = 1; i <= row.text.length; i++) {
-    const w = tctx.measureText(row.text.slice(0, i)).width;
+    const w = lctx.measureText(row.text.slice(0, i)).width;
     if (targetX < (prevW + w) / 2) {
       col = i - 1;
       break;
@@ -489,7 +618,6 @@ function docPosFromPointer(event) {
 
 let dragging = false;
 let dragAnchor = 0;
-
 const stageEl = document.getElementById("stage");
 
 stageEl.addEventListener("pointerdown", (e) => {
@@ -505,7 +633,6 @@ stageEl.addEventListener("pointerdown", (e) => {
     userEvent: "select.pointer",
   });
 });
-
 stageEl.addEventListener("pointermove", (e) => {
   if (!dragging) return;
   const pos = docPosFromPointer(e);
@@ -515,7 +642,6 @@ stageEl.addEventListener("pointermove", (e) => {
     userEvent: "select.pointer",
   });
 });
-
 function endDrag(e) {
   if (!dragging) return;
   dragging = false;
@@ -528,9 +654,9 @@ stageEl.addEventListener("pointerup", endDrag);
 stageEl.addEventListener("pointercancel", endDrag);
 
 // ------------------------------------------------------------------
-// 7. Resize + animation loop. Wait for Bowlby One before kicking off,
-//    otherwise the first frame samples the fallback font and the
-//    stones come out anaemic.
+// 9. Resize + animation loop. Physics + InstancedMesh writes happen
+//    every frame — they're cheap (no canvas readback now that the
+//    glyph cache pays the rasterisation cost once per character).
 // ------------------------------------------------------------------
 function resize() {
   const w = window.innerWidth;
@@ -542,14 +668,19 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
+const clock = new THREE.Clock();
 function tick() {
-  if (dirty) {
-    renderTexture();
-    rebuildStones();
-    dirty = false;
-  }
+  const dt = Math.min(clock.getDelta(), 1 / 30);
+  step(dt);
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
 
-document.fonts.load(`${FONT_SIZE}px "Bowlby One"`).then(tick);
+document.fonts.load(`${FONT_SIZE}px "Bowlby One"`).then(() => {
+  // Pre-warm the cache for the initial doc so the first frame
+  // already has stones (and the spring snaps them in nicely).
+  for (const ch of initialDoc) {
+    if (ch !== " " && ch !== "\n" && ch !== "\t") getGlyph(ch);
+  }
+  tick();
+});
