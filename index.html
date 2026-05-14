@@ -3,69 +3,45 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Editor in WebGL · demos</title>
+    <title>Editor in WebGL</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,700&family=Inter:wght@400;500;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@300;400;500&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <main>
-      <header>
-        <h1>Editor in WebGL</h1>
-        <p>
-          A small series of demos that take a real, functioning text editor —
-          input, selection, undo, IME and all — and render its picture through a
-          layer of WebGL. The editor brain is always a hidden CodeMirror
-          instance; only what you see in front of it changes.
-        </p>
-      </header>
+      <h1>Editor in WebGL</h1>
 
       <ol class="demos">
         <li>
           <a href="demos/undulating-surface/">
             <span class="num">01</span>
-            <h2>Undulating surface</h2>
-            <p>
-              Dark brown text on a tan page that bends and swells under a
-              domain-warp shader. A serif you can write on like cloth.
-            </p>
+            <span class="title">Undulating surface</span>
           </a>
         </li>
         <li>
           <a href="demos/cloud-text/">
             <span class="num">02</span>
-            <h2>Writing in clouds</h2>
-            <p>
-              Thick sans-serif glyphs lit from within, raymarched as a
-              volumetric slab of noisy smoke against a dark sky.
-            </p>
+            <span class="title">Writing in clouds</span>
           </a>
         </li>
         <li>
           <a href="demos/stone-letters/">
             <span class="num">03</span>
-            <h2>Letters from stones</h2>
-            <p>
-              Every glyph reassembled out of small 3D pebbles, instanced from
-              the rasterised silhouette of the live document.
-            </p>
+            <span class="title">Letters from stones</span>
+          </a>
+        </li>
+        <li>
+          <a href="demos/fabric-text/">
+            <span class="num">04</span>
+            <span class="title">Under the fabric</span>
           </a>
         </li>
       </ol>
-
-      <footer>
-        <p>
-          Each demo is a standalone folder containing an
-          <code>index.html</code>, <code>script.js</code>,
-          <code>styles.css</code> and a <code>README.md</code> walkthrough. No
-          build step; open any <code>index.html</code> directly or serve the
-          repo with <code>python3 -m http.server</code>.
-        </p>
-      </footer>
     </main>
   </body>
 </html>

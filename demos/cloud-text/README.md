@@ -1,165 +1,180 @@
 # Writing in clouds
 
-A live editor rendered as a thin volumetric slab of smoke. The glyphs
-glow from inside a noise-warped fog; type, click, drag, and the cloud
-re-forms around the new shape of the document.
+A live editor rendered as a thin volumetric slab of smoke. The
+glyphs glow from inside a noise-warped fog; type, click, drag, and
+the cloud re-forms around the new shape of the document. The camera
+floats with the caret, so the text you're working on stays roughly
+centred under your eye.
 
-This is demo #02 in the series. It shares the editor scaffolding with
-[`../undulating-surface/`](../undulating-surface/) — a hidden
+This is demo #02 in the series. It shares the editor scaffolding
+with [`../undulating-surface/`](../undulating-surface/) — a hidden
 CodeMirror instance owns input, a 2D canvas rasterises a stylised
-picture of its state every frame, and a single WebGL pass turns that
-picture into something the user actually sees. The bit that changes
-between demos is only the last step.
+picture of its state every frame, and a single WebGL pass turns
+that picture into something the user actually sees. The bit that
+changes between demos is only the last step.
 
 ---
 
 ## The picture in one sentence
 
-> A full-screen quad whose fragment shader raymarches a Z-aligned slab
-> of 3D fbm noise, using the editor's text canvas as the density field
-> at z = 0.
+> A full-screen quad whose fragment shader raymarches a thin
+> Z-aligned slab — but only after a 5-tap pre-check confirms there
+> *is* text in this fragment's neighbourhood; on empty sky pixels
+> we exit before the loop even starts.
 
-That's the whole trick. Everything else is parameter tuning.
+The first version of this demo did the textbook "fat raymarch every
+pixel" thing — 32 steps, 5-octave fbm, a per-step shadow tap — and
+it ground to a crawl on anything but a small window. The current
+version applies three of the optimisations
+[Maxime Heckel writes about](https://blog.maximeheckel.com/posts/real-time-cloudscapes-with-volumetric-raymarching/):
 
----
+1. **Empty space skipping** via a cheap density probe.
+2. **Fewer, smarter steps** — 12 instead of 32, with an early-out
+   when transmittance gets low enough.
+3. **2D fbm with z baked into translation**, not a true 3D fbm —
+   visually identical on a slab this thin, ~half the noise cost.
 
-## 1. The atlas: thick glyphs, two channels
-
-The texture canvas is a 2048×2048 black field with the document
-painted on top. Compared to demo #01 the differences are small but
-deliberate:
-
-- **Archivo Black at 900 weight.** Volumetric rendering eats thin
-  shapes — a hairline serif would dissolve into the noise long before
-  it became legible. A heavy display sans gives the shader enough
-  density to chew on.
-- **White text on black, not brown on tan.** The atlas is being read
-  as a density field, not a colour map. The red channel goes straight
-  into the volume integral; anything that isn't glyph should be zero.
-- **Selection painted blue, not as a translucent overlay.** The
-  fragment shader splits channels: `r` drives glyph density, `b − r`
-  recovers a selection mask, and that mask gets its own (cooler,
-  brighter) emission colour. So a highlight isn't a separate layer —
-  it's a region of the same volume that happens to glow blue.
-- **The cursor is painted in the same atlas** as a small bright
-  rectangle in cyan. The shader doesn't know it's a cursor; it just
-  treats it as a particularly bright local density and lets it glow.
-
-All the wrapping, scrolling, markdown styling, and hit-test
-bookkeeping are exactly the same as in demo #01 — the `visualRows`
-table is the lingua franca that maps between document coordinates and
-texture pixels for both rendering and click handling.
+The result is fast enough that the camera can sit close to giant
+glyphs and still hit framerate.
 
 ---
 
-## 2. The volumetric pass
+## 1. The atlas: huge glyphs, two channels
 
-The geometry is dead simple: a single `PlaneGeometry(3.4, 3.4, 1, 1)`.
-No tessellation, no displacement, no surface at all. All the depth
-the user perceives is conjured per-pixel in the fragment shader.
+The texture canvas is a 3072² black field with the document
+painted in three colours:
 
-For each fragment we march `N=32` evenly-spaced samples along a thin
-slab in z. At each sample point we evaluate three things:
+- **White `#ffffff`** for glyphs.
+- **Blue `#6a86ff`** for selection rectangles.
+- **Cyan `#aeefff`** for the cursor block.
 
-1. **Where in the atlas to look** — start from the fragment's UV,
-   offset by a per-slice noise displacement whose magnitude grows
-   with `|z|`. The slab's centre sits exactly on the painted glyphs;
-   the front and back of the slab fray outward.
-2. **How dense the volume is here** — multiply the glyph mask by a
-   Gaussian window in z (`exp(-z² · 11)`), then modulate by 3D fbm so
-   the inside of every glyph billows and roils instead of looking
-   like a flat sheet.
-3. **What colour it emits** — a warm cream for normal text, a cooler
-   blue for selected text. A one-tap secondary noise sample along the
-   light direction stands in for a full shadow march, just enough to
-   keep the cloud from looking uniformly lit.
+The shader recovers each as a separate density via channel
+arithmetic: glyph density is the red channel, selection density is
+`b − r * 0.6` clamped, cursor and glyph share the bright path.
 
-The accumulator does a textbook front-to-back composite with
-Beer-Lambert transmittance:
+`FONT_SIZE` is 280 — much bigger than demo #01 — because the
+camera is zoomed in tightly and small glyphs would dissolve into
+noise before they became readable. Archivo Black at 900 weight
+gives the shader thick, fat strokes that survive the warp.
 
-```
-emit  += trans · sliceEmit · dens · dz · K_emit
-trans *= exp(-dens · dz · K_extinct)
+---
+
+## 2. The camera follows the cursor
+
+The fragment shader reads two new uniforms:
+
+```glsl
+uniform vec2 uOrigin;     // atlas UV the camera is centred on
+uniform vec2 uViewSize;   // fraction of atlas the screen shows
 ```
 
-Trans starts at 1 and decays as we move through dense regions, so the
-nearer parts of a glyph occlude what's behind them. With an early-out
-at `trans < 0.01` the shader rarely takes more than a dozen steps per
-pixel inside a thick glyph, and zero on the empty sky outside.
+and computes its atlas lookup as:
 
-A couple of small touches sit on top of the integral:
+```glsl
+vec2 atlasUv = uOrigin + (vUv - 0.5) * uViewSize;
+```
 
-- A faint **drifting sky** behind the volume — a single fbm sample
-  shaded between two dark blue-greys — so the canvas isn't dead black
-  outside the text.
-- A **per-pixel parallax**: the slab's UV at each slice is offset by
-  a ray-direction term derived from the fragment's NDC, so the front
-  of a glyph sits visibly forward of the back of the same glyph.
-  Cheap, sells volume.
-- **Reinhard tone mapping** (`col / (col + 0.85)`) so the brightest
-  cores roll off into highlights instead of clipping flat.
-- A hash-based **grain** of ±0.0125 so the dark regions have life and
-  the volumetric banding from only 32 steps stops being visible.
+So `uOrigin = (0.5, 0.5)` shows the centre of the atlas;
+`uViewSize.y = 0.42` means the screen height covers 42% of the
+atlas height. The aspect-corrected `uViewSize.x` widens with the
+window.
 
-The 3D fbm is built on a tiny `hash13 → vnoise` pair — three lines of
-mix-of-mixes value noise, five octaves. No textures, no precomputed
-permutation table; the GPU is fast enough that procedural beats the
-texture lookup in this regime.
+On the JS side we track the cursor's pixel position in the atlas
+(updated inside the texture-paint pass) and lerp `uOrigin` toward
+it every frame:
 
----
+```js
+const t = targetOrigin();    // cursor UV, clamped to atlas
+clampOrigin(t);
+camOrigin.lerp(t, 0.12);     // not exact — gives the camera lag
+```
 
-## 3. Why a single quad, not real geometry
+The `0.12` factor is the only tuning knob: low enough that arrow-
+key sweeps glide rather than jump, high enough that the camera
+keeps up with sustained typing. The clamp guarantees the visible
+window stays inside the atlas, so the edges never reveal blank
+canvas.
 
-You could imagine the cloud as a stack of textured planes
-(impostor-style), or as a real low-resolution volume texture, or as
-particle billboards. All of those work, and all of them lose what
-this demo has: the editor's *live* texture maps one-to-one into the
-volume, every frame, with no upload step beyond the existing
-`CanvasTexture` blit. Re-rasterising the atlas every frame is already
-cheap; spending the GPU on a fragment-side raymarch instead of CPU
-geometry keeps the latency from keystroke to visible cloud at one
-frame.
+A side effect of camera-follow: the cursor's atlas position is
+*always* recorded, even on the blink-off frames where the bright
+cyan cursor block isn't being painted. Without that, the camera
+would pulse with the blink — visually awful. Recording the position
+unconditionally and only gating the *paint* on `cursorBlink` keeps
+the camera glued to the caret regardless.
 
 ---
 
-## 4. Hit testing
+## 3. The volumetric pass, lean version
 
-A flat quad with identity UV → atlas coordinates → row/col is the
-simplest possible hit test, and it's exactly what this demo uses. The
-raycaster intersects the (visually invisible, geometrically still
-there) quad; the resulting `uv` is converted to texture pixels and
-then to a document position by walking `visualRows` and binary-style
-measuring against `tctx.measureText`. The fact that the cloud appears
-"in front of" the quad doesn't matter — clicks are aimed at the
-underlying flat shape, which is exactly where the glyphs sit in the
-atlas.
+For each fragment, the shader does:
 
-The pointer-event dance (pre-`pointerdown` focus + `preventDefault`,
-re-focus on `pointerup`) is identical to demo #01. See its README for
-the painful Firefox details.
+1. **Pan + zoom** the screen UV into the atlas.
+2. **Pre-check** with `densityProbe(atlasUv)`: a 5-tap lookup at
+   the centre and four ±0.060 offsets. The max across all `r` and
+   `b` channels is taken as a "is anything text-like nearby?"
+   signal. If it's below ~0.03, the fragment is pure sky — output
+   the gradient and exit. This is the optimisation that makes the
+   demo actually playable.
+3. If the pre-check passes, also **sample the unwarped atlas at the
+   fragment's atlasUv** to anchor the density. Without this anchor,
+   pixels inside letter counter-forms (the holes in `o`, `e`, `B`)
+   pass the probe — the probe radius is wider than a glyph stem —
+   but every warped sample inside the loop lands off the glyph and
+   accumulates zero emission. They render as black cutouts framed
+   by bright letterform. The anchor fixes that by taking
+   `glyph = max(glyphCenter, glyphWarp)` per step: the warp can
+   puff density outward but can never dim what's already on the
+   glyph.
+4. **March 8 steps** through a thin slab in z, with a per-pixel
+   *spatial* hash offsetting the march phase. Eight straight steps
+   read as eight stacked posters; eight jittered steps read as soft
+   smoke because adjacent pixels sample at slightly shifted z.
+5. At each step: sample 2D fbm (2 octaves), warp the atlas lookup,
+   compute density from `(glyph * 1.0 + seln * 0.7) × window ×
+   (0.80 + 0.30 · n)`. The `0.80` floor on the noise multiplier
+   means even in noise-dark areas density stays at 80% of the
+   glyph value — letters can't strobe through to sky-black.
+6. **Composite** with Beer-Lambert transmittance, with an early-
+   out when `trans < 0.02`.
+7. **Tone-map** with `col / (col + 0.85)` so the bright cores roll
+   off into highlights.
+
+No 3D noise, no secondary rays, no normal estimation. The
+"volumetric" feel comes from accumulating warped 2D samples along
+a thin slab with proper transmittance.
+
+---
+
+## 4. Hit testing under the pan/zoom
+
+Click handling has to undo the same `uOrigin + (vUv - 0.5) *
+uViewSize` transform the shader applied:
+
+```js
+const sx = event.clientX / window.innerWidth;
+const sy = 1 - event.clientY / window.innerHeight;
+const atlasU = camOrigin.x + (sx - 0.5) * viewSize.x;
+const atlasV = camOrigin.y + (sy - 0.5) * viewSize.y;
+```
+
+then convert atlas UV → atlas pixels → row/col by walking
+`visualRows` and measuring with `tctx.measureText` — exactly the
+same routine as the other demos. There's no raycaster anymore (no
+3D mesh to hit), just direct math against the screen and the known
+camera state.
 
 ---
 
 ## 5. Knobs
 
-If you want to play, the most expressive numbers live in the fragment
-shader:
-
 | What | Where | Effect |
 | ---- | ----- | ------ |
-| `STEPS` | `for (int s = 0; s < STEPS; s++)` | Quality vs. cost. 24 is grainy, 48 is butter. 32 is the default. |
-| `zNear` / `zFar` | top of the loop | Slab thickness. Wider = blurrier, deeper-looking glyphs. |
-| `exp(-z * z * 11.0)` | density window | The `11` controls how tightly density hugs z=0. Smaller = thicker clouds. |
-| `(0.045 + 0.085 * abs(z))` | UV warp magnitude | How frayed glyph edges get along z. |
-| `K_emit` (the `* 3.6`) and `K_extinct` (the `* 5.5`) | accumulator | Brightness vs. occlusion. Push emit up and clouds glow; push extinct up and they shadow themselves more. |
-| `vec3 textCol` / `vec3 selCol` | inside the loop | Glyph and selection colours, before tone mapping. |
-
-The 3D-fbm reference at
-<https://discourse.threejs.org/t/efficient-volumetric-clouds/66067/2>
-is worth a read for context on the raymarch shape, even though this
-demo is using value noise rather than the linked Worley setup —
-glyphs are a small enough density support that the cheaper noise is
-already enough.
+| `STEPS` | inside the march | Quality vs. cost. 12 is the default; 16 is silkier. |
+| `0.02` in `if (probe < 0.02)` | early-out threshold | Lower = more conservative skip; higher = more pixels marked sky. |
+| `0.045` in `densityProbe` | probe radius | Has to cover the worst-case warp magnitude. |
+| `(0.020 + 0.060 * abs(z))` | UV warp magnitude | How frayed glyph edges get. |
+| `baseH` in `updateViewSize` | `0.42` | Camera zoom. Smaller = closer. |
+| Lerp factor `0.12` in `tick()` | camera follow | How "sticky" the camera is to the caret. |
 
 ---
 
@@ -168,18 +183,19 @@ already enough.
 - `index.html` — mounts the WebGL canvas and the hidden editor host.
 - `styles.css` — full-screen dark; parks the editor host behind the
   canvas.
-- `script.js` — CodeMirror setup, the atlas painter, the three.js
-  scene, the volumetric raymarch shader, and the pointer hit testing.
+- `script.js` — CodeMirror setup, the atlas painter, the orthographic
+  full-screen quad, the lean volumetric shader, the camera-follow
+  loop, and the pointer hit testing.
 - `README.md` — this file.
 
 ## Running
 
 Open `index.html` directly, or serve the repo root with
-`python3 -m http.server`. No build step; `three` and CodeMirror load
-at runtime from `esm.sh`.
+`python3 -m http.server`. `three` and CodeMirror load at runtime
+from `esm.sh`; Archivo Black loads from Google Fonts.
 
 ## Controls
 
 - **Click** to place the caret.
 - **Drag** to select.
-- **Type** — markdown headings and blockquotes pick up extra weight.
+- **Type** — the camera glides to follow you.

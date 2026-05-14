@@ -1,231 +1,239 @@
 # Letters from stones
 
 The same live editor as the other demos, but each visible glyph is
-reassembled out of a few hundred small 3D pebbles. Type a letter,
-and a pile of stones materialises in its shape; delete it, and they
-vanish. Selection paints them ochre; the caret is a small heap of
-amber stones that blinks.
+reconstituted out of small stones whose layout traces the shape of
+the letter. Looking straight down at a horizontal page; each stone
+has its own physics — falls from a shallow height onto the page,
+bounces once or twice on a hard surface, settles. Type a character
+and a fresh cluster of stones rains down in its shape; delete one
+and its stones get kicked outward and tumble off the page.
 
-This is demo #03 in the series. It shares the hidden-CodeMirror /
-2D-canvas / WebGL-overlay pattern with demos #01 and #02 — see the
-[undulating-surface README](../undulating-surface/) for the bones of
-that architecture. The only piece that changes is, again, the last
-step: how the 2D canvas becomes pixels on the screen.
+This is demo #03 in the series. Same hidden-CodeMirror /
+2D-canvas / WebGL-overlay pattern as the rest — see the
+[undulating-surface README](../undulating-surface/) for the bones
+of that architecture.
 
 ---
 
 ## The picture in one sentence
 
-> A `THREE.InstancedMesh` of low-poly icosahedra, with one instance
-> placed at every Nth lit pixel of the editor's rasterised text
-> canvas, tinted by the colour-coded category (text / selection /
-> cursor) the canvas painted at that pixel.
+> Each unique character is rasterised once into a per-glyph stone
+> cluster (jittered-grid sampling of its bitmap); the document is
+> a list of `(docPos, glyphStoneIdx)` keys; each stone integrates
+> its own gravity + hard-surface-bounce + lateral-spring physics
+> over a stable home position derived from where its character
+> sits in the layout.
 
-That's it. No raymarching, no shaders, no custom geometry — just
-instancing driven by a CPU-side bitmap walk.
-
----
-
-## 1. The sampling canvas as a tri-state mask
-
-The texture canvas is rasterised at 1024² (smaller than the previous
-demos — we're not minifying GPU samples here, we're doing per-frame
-`getImageData` from JS, and 1 MP fits in a few ms of memory copy).
-On it we paint three distinct flat colours:
-
-- **Near-black `#101010`** for unselected glyphs and the blockquote
-  bar.
-- **Red `#c8341d`** for glyphs that fall inside the active selection.
-- **Yellow `#f4c020`** for the cursor block.
-
-Everything else is white. The walk that decides selection colour is
-character-by-character: as we render each row we check whether each
-character's document position is inside `[selFrom, selTo)` and pick
-the paint accordingly. This is more work per row than demo #01's
-"draw a translucent rectangle behind a black glyph" approach, but it
-buys us a single-channel mask where selection survives the
-rasterisation cleanly — the instancer needs to classify each lit
-pixel from RGB alone, and translucent overlays would make that
-ambiguous.
-
-Bowlby One was picked specifically because its strokes are fat
-enough that even at FONT_SIZE=78 each stem is ~10 pixels across — at
-STRIDE=7 that's room for a stone or two per stem, with enough
-thickness that the letterforms don't dissolve into Morse code.
+The first version of this demo placed stones on a fixed grid and
+moved them as a unit toward each letter's target. They looked
+correct but bounced in lockstep — the whole letter pulsing as a
+single spring system. The current version replaces the springs
+with real per-stone gravity on a hard horizontal surface and adds
+a staggered spawn delay so the cluster *rains* into place rather
+than dropping as a single body.
 
 ---
 
-## 2. Bitmap → instances
+## 1. Per-character glyph cache
 
-Every frame (gated by a dirty flag — see §4), `rebuildStones()` does
-a single `ctx.getImageData(0, 0, TEX, TEX)` and walks the buffer at
-a fixed `STRIDE`. For each candidate pixel:
-
-1. **Classify** by RGB: dark → text, red-dominant → selection,
-   yellow-ish → cursor, otherwise background (skip).
-2. **Compute world position** from the canvas coordinate. The page
-   group is a horizontal-ish plane tilted ~30° from flat (a music
-   stand, not a floor); a canvas pixel maps to a point on its
-   surface via a straightforward UV ↔ XY transform.
-3. **Stable jitter** keyed on the integer pixel coords — see §3 —
-   produces a per-stone scale, rotation, XY jitter, and lift height.
-4. **Tint** by lerping between a base colour and a brighter "hilite"
-   per category, using the same hash for the lerp factor so the same
-   pixel always paints the same tone.
-
-The matrix and colour get written into the `InstancedMesh` and we
-bump the live count. Whatever's beyond the live count keeps whatever
-matrices it held last time, but isn't drawn (`stones.count` controls
-the draw range).
-
-Cap is `MAX_STONES = 9000`. In practice a typical screenful of body
-text uses 1500–3500 instances; the cap is there so a wall of
-headings can't blow past it.
-
----
-
-## 3. Why the per-pixel hash matters
-
-If every frame produced fresh random offsets, the stones would
-crawl. The fix is to derive their offsets deterministically from
-their grid coordinate:
+For each unique character we touch we render it once into a 384²
+scratch canvas, walk that canvas on a jittered grid (`STRIDE = 14`,
+~60–90 cells lit per Bowlby-One letter), and store a list of stone
+offsets along with per-stone randomness drawn from the same hash:
+scale, rotation, base colour mix, spawn delay, drop-extra,
+restitution, and an XZ "kick" direction.
 
 ```js
-function pixelSeed(gx, gy) {
-  return (gx * 374761393) ^ (gy * 668265263);
-}
-function rng(seed) {
-  let s = seed >>> 0;
-  return () => {
-    s = (s * 1664525 + 1013904223) >>> 0;
-    return s / 4294967296;
-  };
-}
-```
-
-Same pixel → same seed → same scale, rotation, jitter, lift, tint.
-The result is that as you type, the new glyph's stones appear in
-place and the old ones stay frozen; as you select a range, the
-existing stones change colour but don't move. It's the difference
-between an effect and a special effect.
-
-The `pixelSeed` here is a cheap Cantor-pair-ish XOR — collision
-probability is fine for our 128×128 candidate grid.
-
----
-
-## 4. Don't rebuild unless the picture changed
-
-`getImageData` is the most expensive thing on this page. A 1024²
-read is ~4 MB and shows up clearly in a profile if you do it 60
-times a second.
-
-We don't have to. The picture only changes when:
-
-- the document changes (typing, paste, undo),
-- the selection moves (anchor or head),
-- the cursor blink toggles,
-- the visible scroll window shifts (which happens *because* of one
-  of the above — never on its own).
-
-So we add a CodeMirror update listener that flips a `dirty` flag on
-any doc or selection change, the cursor-blink interval flips it too,
-and the per-frame `tick()` only re-rasterises and re-instances when
-`dirty` is set:
-
-```js
-const dirtyExt = EditorView.updateListener.of((u) => {
-  if (u.docChanged || u.selectionSet) dirty = true;
+stones.push({
+  x: px - 1,
+  y: py - 1 - ascent,
+  scale: 0.55 + r() * 0.6,
+  rotX: (r() - 0.5) * 0.7,
+  rotY: (r() - 0.5) * 0.7,
+  rotZ: r() * Math.PI * 2,
+  colorT: r(),
+  delay: r() * 0.35,
+  dropExtra: r() * 0.25,
+  kickX: r() - 0.5,
+  kickZ: r() - 0.5,
+  restitution: 0.28 + r() * 0.12,
 });
-setInterval(() => { cursorBlink = !cursorBlink; dirty = true; }, 530);
-
-function tick() {
-  if (dirty) {
-    renderTexture();
-    rebuildStones();
-    dirty = false;
-  }
-  renderer.render(scene, camera);
-  requestAnimationFrame(tick);
-}
 ```
 
-`renderer.render` still happens every frame so the camera could be
-animated later if we wanted; the heavy work happens only on actual
-change. Idle, the page is essentially free.
+The randomness is keyed on `(charCode, cellIndex)` so every "a" in
+the document is the same shape — recognisable as an a — but every
+stone within an a has its own physical parameters. That's the
+distinction: glyph *shape* is shared across instances, glyph
+*behaviour* is per-stone.
+
+The cache is paid once per unique character; the rest of the
+document is pure cache hits.
 
 ---
 
-## 5. The scene
+## 2. Drop physics on a hard surface
 
-Nothing exotic on the rendering side — that's the point. A
-`MeshStandardMaterial` on icosahedral stones, lit by:
+Each stone holds `{ pos, vel, homeX, homeZ, restitution, delay,
+age, dying }`. The page is the XZ plane at `y = 0`; a stone at rest
+has its centre at `y = STONE_RADIUS`.
 
-- a **HemisphereLight** (warm sky on top, sandy ground from below)
-  for the wraparound base term,
-- a **DirectionalLight** keyed warm and high, and
-- a faint cool **rim DirectionalLight** from behind.
+Per frame, after `dt = min(getDelta(), 1/30)`:
 
-The "sky" is a single back-faced sphere with a two-colour gradient
-shader — flat, no normal shading, just a vertical lerp. A
-`THREE.Fog` matches the lower sky colour so the page edges and the
-far stones blend out cleanly without a hard horizon.
+```js
+s.age += dt;
+if (!s.dying && s.age < s.delay) continue;   // pending — still on its spawn timer
 
-The page itself is a single `PlaneGeometry` parented to a tilted
-group. That group's transform is the only piece of orientation
-maths in the file — every stone lives in the group's local space,
-so all the canvas-to-world bookkeeping stays 2D.
+if (s.dying) {
+  s.vel.y += GRAVITY * dt;
+  s.pos.addScaledVector(s.vel, dt);
+  // tumble while falling
+  if (s.pos.y < -3) stoneState.delete(k);
+  continue;
+}
+
+// Live stone — vertical: gravity + hard surface at STONE_RADIUS.
+s.vel.y += GRAVITY * dt;
+s.pos.y += s.vel.y * dt;
+if (s.pos.y < STONE_RADIUS) {
+  s.pos.y = STONE_RADIUS;
+  if (s.vel.y < -SETTLE_VEL) {
+    s.vel.y = -s.vel.y * s.restitution;  // bounce
+    s.vel.x *= 0.55;                     // friction kills lateral skid
+    s.vel.z *= 0.55;
+  } else {
+    s.vel.y = 0;                         // settled
+  }
+}
+
+// Live stone — horizontal: a soft spring to (homeX, homeZ), so
+// layout shifts (text reflow, scroll) make stones SLIDE rather
+// than teleport.
+const dxh = s.homeX - s.pos.x;
+const dzh = s.homeZ - s.pos.z;
+s.vel.x += (LATERAL_K * dxh - LATERAL_DAMP * s.vel.x) * dt;
+s.vel.z += (LATERAL_K * dzh - LATERAL_DAMP * s.vel.z) * dt;
+s.pos.x += s.vel.x * dt;
+s.pos.z += s.vel.z * dt;
+```
+
+Three things make the result feel like individual stones rather
+than a single bouncing letter:
+
+1. **Per-stone spawn delay.** Each stone of a newly-typed letter
+   gets a random `delay` of 0–0.35 s; until its `age` exceeds
+   that, the stone is held off-stage at zero scale and not
+   integrated. The letter spawns over the course of a third of a
+   second, not all at one instant.
+2. **Per-stone restitution.** Each stone bounces a slightly
+   different amount, so the bounces don't synchronise.
+3. **Separated axes.** Y is hard-surface bounce; X and Z are soft
+   spring. A letter that gets layout-shifted by an edit makes the
+   stones *slide* across the page rather than teleporting or
+   resetting, but the bounce dynamics are completely physical.
+
+Dying stones get a strong outward kick (random horizontal
+direction, 1.6 m/s upward) and lose surface collision so they fall
+through and below the page. Looks like they fly off.
 
 ---
 
-## 6. Hit testing
+## 3. Stone identity remapped through edits
 
-The page plane is a real mesh in the scene, so the raycaster
-intersects it directly. Once we have a UV we convert to canvas
-pixels and then walk `visualRows` — exactly the same routine as
-demo #01. The stones themselves are never hit-tested; they aren't
-geometrically present where the user clicks (they sit *above* the
-plane), and trying to raycast 3000 small instances per click would
-be both expensive and pointless.
+Same as the previous version: each stone is keyed by
+`${docPos}:${glyphStoneIdx}` and a CodeMirror `updateListener`
+remaps every existing stone's docPos through the transaction's
+`changes.mapPos(oldPos, 1)`. Without this, every keystroke in the
+middle of a paragraph would cascade-respawn everything after it.
+With it, stones for the same character slide to the new layout
+position and existing physics state survives.
 
-This is one of the reasons the page plane is kept in the scene as a
-visible-but-flat ground rather than thrown away after instancing:
-it doubles as the click target.
+When a remap collides — meaning the character at `oldPos` was
+deleted and is colliding with a survivor — the displaced stone
+gets a unique `"orphan:..."` key in the dying pool, where the
+gravity-only path takes it off the page.
 
 ---
 
-## 7. Knobs
+## 4. Straight-down camera with tracking
+
+The page is horizontal (`PlaneGeometry` rotated `-π/2` around X)
+and the camera is parked directly above it:
+
+```js
+camera.up.set(0, 0, -1);
+camera.position.set(0, CAMERA_HEIGHT, 0);
+camera.lookAt(0, 0, 0);
+```
+
+`camera.up.set(0, 0, -1)` is the only fiddly bit. With a default
+camera looking straight down (forward `(0, -1, 0)`), the up
+direction is otherwise undefined; pinning it to world `-Z` puts
+the top of the canvas (which maps to world `-Z` through the
+page's rotation) at the top of the screen.
+
+Tracking: `cursorWorldX/Z` are computed in `buildTargets()` from
+the caret's atlas position; each frame `camTargetX/Z` lerps toward
+them and the camera's position is set to `(camTargetX, H,
+camTargetZ)`. A pre-frame **clamp** keeps the visible window
+inside the page bounds — at the camera's height we know exactly
+how much of the world is on screen, so we clamp the target so
+`PAGE_WIDTH × PAGE_DEPTH` always covers the viewport on every
+edge.
+
+The lerp factor `0.10` is the only sticky parameter: high enough
+to keep up with sustained typing, low enough that arrow-key
+sweeps glide rather than jump.
+
+---
+
+## 5. Hit testing
+
+Identical to the previous version: raycast the page plane, recover
+its UV, walk `visualRows` + `measureText` to get a doc position.
+The stones aren't hit-tested. The page plane's UV is the
+ground-truth coordinate space for both rendering and clicks; the
+stones live above it as decoration.
+
+The page is now horizontal in world space, so the UV recovery just
+inverts `pageToWorld` — the raycaster does the page-rotation work
+for free.
+
+---
+
+## 6. Knobs
 
 | What | Where | Effect |
 | ---- | ----- | ------ |
-| `STRIDE` | top of file | Stone density. Lower = more, denser glyphs, slower. 7 is the default. |
-| `FONT_SIZE`, `LINE_HEIGHT`, `PADDING` | top of file | How big the glyphs are on the canvas relative to the page. |
-| `MAX_STONES` | InstancedMesh setup | Hard cap before the rebuild stops. Raise it if you fill the screen with bold text. |
-| `pageGroup.rotation.x` | scene setup | How much the page tips from vertical. -π/2 is fully flat; 0 is a billboard. |
-| `STONE_RADIUS` and the scale lerp `0.55 + s * 0.6` | inside `rebuildStones` | Stone size and variance. |
-| `lift = scale * (0.4 + s * 1.1)` | inside `rebuildStones` | How much stones lift off the page. Higher = piles, lower = tiles. |
-| `STONE_*_BASE` / `_HILITE` colours | top of file | The two-tone palette per category. |
+| `STRIDE` | top of file | Stones per glyph. 14 → ~60–90 in Bowlby One. Drop to 11 for denser, raise to 18 for sparser. |
+| `STONE_RADIUS` | scene setup | World-space stone size. About half the previous demo's. |
+| `FONT_SIZE` | top of file | Canvas-space glyph size. Twice the previous demo's. |
+| `DROP_HEIGHT` | physics constants | How far above the page a fresh stone spawns. 0.4 = "shallow drop"; raise toward 1.0 for "rain from a height". |
+| `LATERAL_K`, `LATERAL_DAMP` | physics constants | How tightly stones track layout shifts in XZ. Higher K = quicker slide. |
+| `SETTLE_VEL` | physics constants | Below this |vel.y| the bounce stops. Lower = more tiny bounces, higher = stones stop sooner. |
+| `s.restitution` range (in glyph cache) | per-stone bounce | The `0.28 + r() * 0.12` band — wider = more visible variation between stones. |
+| `CAMERA_HEIGHT`, FOV | scene setup | How much of the page is visible. Pull camera up or widen FOV to see more at once. |
+| Camera-track lerp `0.10` | `updateCamera()` | How sticky the camera is to the caret. |
 
 ---
 
 ## Files
 
 - `index.html` — mounts the WebGL canvas and the hidden editor host.
-- `styles.css` — full-screen sand; parks the editor behind the
-  canvas via the same z-index trick.
-- `script.js` — CodeMirror setup, the tri-state sampling-canvas
-  painter, the instanced-mesh stone rebuilder, the scene + lights,
-  and the pointer hit testing.
+- `styles.css` — body background matched to the sky tone so the page
+  edges fall away cleanly.
+- `script.js` — CodeMirror with the docPos remap listener, the
+  per-character glyph cache, the per-stone physics integrator, the
+  scene with straight-down tracking camera, and pointer hit testing.
 - `README.md` — this file.
 
 ## Running
 
 Open `index.html` directly, or serve the repo root with
-`python3 -m http.server`. No build step; `three` and CodeMirror load
-at runtime from `esm.sh`.
+`python3 -m http.server`.
 
 ## Controls
 
 - **Click** to place the caret.
 - **Drag** to select.
-- **Type** — markdown headings and blockquotes still pick up styling.
+- **Type** — new stones rain in. Delete — old ones get kicked out
+  and fall.
