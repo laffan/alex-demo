@@ -1,36 +1,42 @@
 import { EditorView, basicSetup } from "https://esm.sh/codemirror@6.0.1";
 import { markdown } from "https://esm.sh/@codemirror/lang-markdown@6.2.4";
 import * as THREE from "https://esm.sh/three@0.160.0";
+import RAPIER from "https://esm.sh/@dimforge/rapier3d-compat@0.13.0";
 
 // ------------------------------------------------------------------
 // 0. Palette.
 // ------------------------------------------------------------------
 const SKY_HEX = "#cdb98a";
-const GROUND_HEX = "#b9a376";
+const HORIZON_HEX = "#9d8758";
+const GROUND_HEX = "#bda175";
+const GROUND_DEEP_HEX = "#7e6c4a";
 
-const STONE_TEXT_BASE = new THREE.Color("#3a2f24");
-const STONE_TEXT_HI = new THREE.Color("#7a6249");
-const STONE_SELECT_BASE = new THREE.Color("#a23a17");
-const STONE_SELECT_HI = new THREE.Color("#dd6a2c");
-const STONE_CURSOR_BASE = new THREE.Color("#f5b630");
-const STONE_CURSOR_HI = new THREE.Color("#fff0a8");
+const ROCK_BASE_HEX = "#3d2f20";
+const ROCK_HI_HEX = "#a08260";
+const ROCK_SELECT_HEX = "#c44a1f";
+
+// Wait for the Rapier WASM blob to decode before doing anything else.
+// The compat build embeds the WASM as base64 so we don't need a
+// separate fetch and a CORS dance.
+await RAPIER.init();
 
 // ------------------------------------------------------------------
-// 1. Hidden CodeMirror editor. Stones live in world space, keyed by
-//    `${docPos}:${glyphStoneIdx}`. An updateListener remaps docPos
-//    through the change set so mid-document edits don't cascade.
+// 1. Hidden CodeMirror editor. Two things hang off it:
+//   - docDirty: rebuild the terrain heightfield when text changes.
+//   - selectionDirty: rebuild rock tints when selection range changes.
 // ------------------------------------------------------------------
-let stoneState = new Map();
-
 const initialDoc = `STONES
 
-each letter you type is built
-out of small stones, sampled
-from the rasterised shape of
-the glyph itself.
+type. the ground digs
+itself into letter-
+shaped troughs and
+rocks rain from above
+to fill them.
 
-type — they fall in.
-delete — they tumble off.`;
+delete to fill in.`;
+
+let docDirty = true;
+let selectionDirty = true;
 
 const view = new EditorView({
   doc: initialDoc,
@@ -38,26 +44,8 @@ const view = new EditorView({
     basicSetup,
     markdown(),
     EditorView.updateListener.of((u) => {
-      if (!u.docChanged) return;
-      const next = new Map();
-      for (const [key, stone] of stoneState) {
-        const colon = key.indexOf(":");
-        const head = key.slice(0, colon);
-        if (head === "cursor" || head === "orphan") {
-          next.set(key, stone);
-          continue;
-        }
-        const oldPos = parseInt(head, 10);
-        const newPos = u.changes.mapPos(oldPos, 1);
-        const newKey = `${newPos}:${key.slice(colon + 1)}`;
-        if (next.has(newKey)) {
-          stone.dying = true;
-          next.set("orphan:" + Math.random().toString(36).slice(2), stone);
-        } else {
-          next.set(newKey, stone);
-        }
-      }
-      stoneState = next;
+      if (u.docChanged) docDirty = true;
+      if (u.selectionSet) selectionDirty = true;
     }),
   ],
   parent: document.getElementById("editor-host"),
@@ -66,24 +54,39 @@ const view = new EditorView({
 view.focus();
 
 // ------------------------------------------------------------------
-// 2. Layout-measurement canvas. We only use it for measureText; the
-//    actual glyph pixels come from the per-character cache below.
+// 2. Text canvas. Same role as the other demos — but here it's a
+//    *heightmap source*: white pixels become indents in the ground
+//    that rocks fall into and shape themselves around.
 // ------------------------------------------------------------------
-const TEX = 1536;
-const FONT_SIZE = 200;
-const LINE_HEIGHT = 260;
-const PADDING = 80;
+const TEX = 1024;
+const FONT_SIZE = 110;
+const LINE_HEIGHT = 140;
+const PADDING = 60;
 const FONT_FAMILY = '"Bowlby One", sans-serif';
 
-const layoutCanvas = document.createElement("canvas");
-layoutCanvas.width = TEX;
-layoutCanvas.height = TEX;
-const lctx = layoutCanvas.getContext("2d");
-lctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
-lctx.textBaseline = "alphabetic";
+const texCanvas = document.createElement("canvas");
+texCanvas.width = TEX;
+texCanvas.height = TEX;
+const tctx = texCanvas.getContext("2d");
+
+// Downsample target for the heightfield. 128² is enough to read the
+// letterforms when rocks settle in, and small enough that the
+// Rapier collider rebuild is sub-millisecond.
+const HMAP_RES = 192;
+const sampleCanvas = document.createElement("canvas");
+sampleCanvas.width = HMAP_RES;
+sampleCanvas.height = HMAP_RES;
+const sctx = sampleCanvas.getContext("2d", { willReadFrequently: true });
 
 let visualRows = [];
 let scrollTopRow = 0;
+let cursorAtlasPx = PADDING;
+let cursorAtlasPy = PADDING;
+
+function setFont() {
+  tctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+  tctx.textBaseline = "alphabetic";
+}
 
 function wrapText(text, maxWidth) {
   if (text.length === 0) return [{ text: "", startCol: 0 }];
@@ -94,7 +97,7 @@ function wrapText(text, maxWidth) {
   let pos = 0;
   for (const tok of tokens) {
     const test = segText + tok;
-    if (lctx.measureText(test).width > maxWidth && segText.length > 0) {
+    if (tctx.measureText(test).width > maxWidth && segText.length > 0) {
       segs.push({ text: segText, startCol: segStart });
       segStart = pos;
       segText = tok;
@@ -123,8 +126,6 @@ function computeLayout() {
         text: seg.text,
         startDocPos,
         endDocPos: startDocPos + seg.text.length,
-        isFirstInLine: i === 0,
-        isLastInLine: i === segs.length - 1,
       });
     }
   }
@@ -141,227 +142,14 @@ function findCursorRow(rows, head) {
   return best;
 }
 
-// ------------------------------------------------------------------
-// 3. Per-character glyph cache. Rasterise once, walk on a jittered
-//    grid, store one stone offset per opaque cell. Cached forever.
-// ------------------------------------------------------------------
-const CACHE = 384;
-const cacheCanvas = document.createElement("canvas");
-cacheCanvas.width = CACHE;
-cacheCanvas.height = CACHE;
-const cctx = cacheCanvas.getContext("2d", { willReadFrequently: true });
+function renderTextToCanvas() {
+  setFont();
+  tctx.fillStyle = "#000";
+  tctx.fillRect(0, 0, TEX, TEX);
 
-function pixelSeed(a, b) {
-  return ((a | 0) * 374761393) ^ ((b | 0) * 668265263);
-}
-function rng(seed) {
-  let s = seed >>> 0;
-  return () => {
-    s = (s * 1664525 + 1013904223) >>> 0;
-    return s / 4294967296;
-  };
-}
-
-const glyphCache = new Map();
-const STRIDE = 14; // ~60–90 stones per character in Bowlby One
-
-function getGlyph(ch) {
-  const cached = glyphCache.get(ch);
-  if (cached) return cached;
-
-  cctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
-  cctx.textBaseline = "alphabetic";
-  const m = cctx.measureText(ch);
-  const advance = m.width;
-  const ascent = (m.actualBoundingBoxAscent || FONT_SIZE * 0.85) | 0;
-  const descent = (m.actualBoundingBoxDescent || FONT_SIZE * 0.25) | 0;
-  const w = Math.max(1, Math.ceil(m.actualBoundingBoxRight ?? advance) + 2);
-  const h = Math.max(1, ascent + descent + 2);
-
-  cctx.clearRect(0, 0, CACHE, CACHE);
-  cctx.fillStyle = "#000";
-  cctx.fillText(ch, 1, ascent + 1);
-
-  const img = cctx.getImageData(0, 0, w, h).data;
-  const stones = [];
-  let idx = 0;
-  for (let gy = 0; gy < h - 1; gy += STRIDE) {
-    for (let gx = 0; gx < w - 1; gx += STRIDE) {
-      const r = rng(pixelSeed(ch.charCodeAt(0) || 0, idx));
-      const jx = r();
-      const jy = r();
-      const px = Math.min(w - 1, (gx + jx * STRIDE) | 0);
-      const py = Math.min(h - 1, (gy + jy * STRIDE) | 0);
-      const i = (py * w + px) * 4;
-      const lit = img[i + 3] > 80 && img[i] + img[i + 1] + img[i + 2] < 250;
-      if (lit) {
-        stones.push({
-          x: px - 1,
-          y: py - 1 - ascent,
-          scale: 0.55 + r() * 0.6,
-          rotX: (r() - 0.5) * 0.7,
-          rotY: (r() - 0.5) * 0.7,
-          rotZ: r() * Math.PI * 2,
-          colorT: r(),
-          // Cached pseudo-randomness consumed when the live stone
-          // spawns. r() must be called a stable number of times per
-          // cell so the per-pixel seed stays deterministic across
-          // calls.
-          delay: r() * 0.35,
-          dropExtra: r() * 0.25,
-          kickX: r() - 0.5,
-          kickZ: r() - 0.5,
-          restitution: 0.28 + r() * 0.12,
-        });
-      }
-      idx++;
-    }
-  }
-  const entry = { advance, ascent, descent, stones };
-  glyphCache.set(ch, entry);
-  return entry;
-}
-
-// ------------------------------------------------------------------
-// 4. three.js scene. Page is *horizontal* (XZ plane at y=0), camera
-//    is *straight down* from above, with horizontal tracking that
-//    glides the camera toward the caret each frame.
-// ------------------------------------------------------------------
-const stage = document.getElementById("stage");
-const renderer = new THREE.WebGLRenderer({ canvas: stage, antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight, false);
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(SKY_HEX);
-scene.fog = new THREE.Fog(SKY_HEX, 8, 18);
-
-const PAGE_WIDTH = 8.0;
-const PAGE_DEPTH = 8.0;
-
-// Horizontal page in XZ plane.
-const groundGeo = new THREE.PlaneGeometry(PAGE_WIDTH, PAGE_DEPTH, 1, 1);
-const groundMat = new THREE.MeshStandardMaterial({
-  color: new THREE.Color(GROUND_HEX),
-  roughness: 0.95,
-  metalness: 0.0,
-});
-const ground = new THREE.Mesh(groundGeo, groundMat);
-ground.rotation.x = -Math.PI / 2;
-ground.position.y = 0;
-scene.add(ground);
-
-// Lights. Key light angled off-vertical so the stones have visible
-// shading from straight overhead. Hemisphere gives a soft fill so
-// the undersides of pebbles aren't pitch-black.
-scene.add(new THREE.HemisphereLight(0xfff4d4, GROUND_HEX, 0.55));
-{
-  const key = new THREE.DirectionalLight(0xfff3c8, 1.2);
-  key.position.set(2.6, 5.0, 2.0);
-  scene.add(key);
-  const rim = new THREE.DirectionalLight(0x9fb8d0, 0.32);
-  rim.position.set(-3.0, 4.0, -2.5);
-  scene.add(rim);
-}
-
-const CAMERA_HEIGHT = 9.0;
-const camera = new THREE.PerspectiveCamera(
-  42,
-  window.innerWidth / window.innerHeight,
-  0.1,
-  60,
-);
-// World "up" on screen = -Z, so canvas-top (which maps to world
-// -Z after our pageToWorld) becomes the top of the screen.
-camera.up.set(0, 0, -1);
-camera.position.set(0, CAMERA_HEIGHT, 0);
-camera.lookAt(0, 0, 0);
-scene.updateMatrixWorld(true);
-
-// ------------------------------------------------------------------
-// 5. Page-canvas → world. Canvas Y runs top→bottom; we map that to
-//    world Z so the top of the document is at world -Z.
-// ------------------------------------------------------------------
-function pageToWorld(canvasX, canvasY, lift, out) {
-  const u = canvasX / TEX;
-  const v = canvasY / TEX;
-  out.set((u - 0.5) * PAGE_WIDTH, lift, (v - 0.5) * PAGE_DEPTH);
-}
-
-// ------------------------------------------------------------------
-// 6. Stones — InstancedMesh, world space.
-// ------------------------------------------------------------------
-const MAX_STONES = 16000;
-const stoneGeo = new THREE.IcosahedronGeometry(1.0, 0);
-stoneGeo.scale(1.0, 0.78, 1.0);
-const stoneMat = new THREE.MeshStandardMaterial({
-  vertexColors: false,
-  roughness: 0.85,
-  metalness: 0.05,
-});
-const stones = new THREE.InstancedMesh(stoneGeo, stoneMat, MAX_STONES);
-stones.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-stones.count = 0;
-scene.add(stones);
-{
-  const colors = new Float32Array(MAX_STONES * 3);
-  stones.instanceColor = new THREE.InstancedBufferAttribute(colors, 3);
-  stones.instanceColor.setUsage(THREE.DynamicDrawUsage);
-}
-
-const dummy = new THREE.Object3D();
-const dummyColor = new THREE.Color();
-
-// Smaller stones than the previous version — about half the world
-// radius. With STRIDE=14 we get plenty of stones per character so
-// even at this size the letterforms remain readable.
-const STONE_RADIUS = 0.012;
-
-// Physics constants.
-const GRAVITY = -9.8;
-const DROP_HEIGHT = 0.4; // shallow — stones drop from ~half a glyph height
-const LATERAL_K = 6.0; // how strongly horizontal motion is pulled to home
-const LATERAL_DAMP = 5.0;
-const SETTLE_VEL = 0.08; // |vel.y| below this when on-surface → snap to rest
-
-// ------------------------------------------------------------------
-// 7. Build target list — one entry per stone that should exist this
-//    frame. Each target carries everything the integrator needs.
-// ------------------------------------------------------------------
-const targets = [];
-const seenKeys = new Set();
-const _home = new THREE.Vector3();
-
-let cursorWorldX = 0;
-let cursorWorldZ = 0;
-
-function computeCursorAtlasPos() {
-  const head = view.state.selection.main.head;
-  if (visualRows.length === 0) return { x: PADDING, y: PADDING };
-  const cursorRowIdx = findCursorRow(visualRows, head);
-  const row = visualRows[cursorRowIdx];
-  const yInRows = cursorRowIdx - scrollTopRow;
-  const yCanvas = PADDING + yInRows * LINE_HEIGHT + FONT_SIZE * 0.5;
-  const localCol = Math.min(
-    Math.max(0, head - row.startDocPos),
-    row.text.length,
-  );
-  lctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
-  const wBefore = lctx.measureText(row.text.slice(0, localCol)).width;
-  return { x: PADDING + wBefore, y: yCanvas };
-}
-
-function buildTargets() {
-  targets.length = 0;
   visualRows = computeLayout();
 
-  const sel = view.state.selection.main;
-  const head = sel.head;
-  const selFrom = Math.min(sel.from, sel.to);
-  const selTo = Math.max(sel.from, sel.to);
-  const hasRange = selFrom !== selTo;
-
+  const head = view.state.selection.main.head;
   const cursorRowIdx = findCursorRow(visualRows, head);
   const visibleRowCount = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
   if (cursorRowIdx < scrollTopRow) scrollTopRow = cursorRowIdx;
@@ -372,307 +160,498 @@ function buildTargets() {
   let y = PADDING;
   for (let r = scrollTopRow; r < visualRows.length; r++) {
     const row = visualRows[r];
-    let x = PADDING;
+    const baseline = y + FONT_SIZE * 0.85;
+    tctx.fillStyle = "#fff";
+    tctx.fillText(row.text, PADDING, baseline);
 
-    for (let i = 0; i < row.text.length; i++) {
-      const ch = row.text[i];
-      const docPos = row.startDocPos + i;
-
-      if (ch === " " || ch === "\t") {
-        x += lctx.measureText(ch).width;
-        continue;
-      }
-
-      const entry = getGlyph(ch);
-      const baseline = y + FONT_SIZE * 0.85;
-      const inSel = hasRange && docPos >= selFrom && docPos < selTo;
-
-      for (let j = 0; j < entry.stones.length; j++) {
-        const st = entry.stones[j];
-        const cx = x + st.x;
-        const cy = baseline + st.y;
-        // Home sits on the page surface — its Y is STONE_RADIUS so
-        // a resting stone's centre is one radius above the table.
-        pageToWorld(cx, cy, STONE_RADIUS, _home);
-
-        targets.push({
-          key: `${docPos}:${j}`,
-          homeX: _home.x,
-          homeZ: _home.z,
-          colorBase: inSel ? STONE_SELECT_BASE : STONE_TEXT_BASE,
-          colorHi: inSel ? STONE_SELECT_HI : STONE_TEXT_HI,
-          colorT: st.colorT,
-          scale: STONE_RADIUS * st.scale,
-          rotX: st.rotX,
-          rotY: st.rotY,
-          rotZ: st.rotZ,
-          delay: st.delay,
-          dropExtra: st.dropExtra,
-          kickX: st.kickX,
-          kickZ: st.kickZ,
-          restitution: st.restitution,
-        });
-      }
-      x += entry.advance;
+    if (r === cursorRowIdx) {
+      const localCol = Math.min(
+        Math.max(0, head - row.startDocPos),
+        row.text.length,
+      );
+      const wBefore = tctx.measureText(row.text.slice(0, localCol)).width;
+      cursorAtlasPx = PADDING + wBefore;
+      cursorAtlasPy = y + FONT_SIZE * 0.5;
     }
+
     y += LINE_HEIGHT;
     if (y > TEX - PADDING) break;
   }
-
-  // Cursor — a small column of bright stones at the caret. They get
-  // the same drop physics as text stones, so when the cursor moves
-  // (or you first open the page) they fall in like everything else.
-  const cur = computeCursorAtlasPos();
-  pageToWorld(cur.x, cur.y, 0, _home);
-  cursorWorldX = _home.x;
-  cursorWorldZ = _home.z;
-
-  const CURSOR_STONE_COUNT = 14;
-  for (let i = 0; i < CURSOR_STONE_COUNT; i++) {
-    const r = rng(pixelSeed(2718281, i));
-    const dx = (r() - 0.5) * STONE_RADIUS * 1.8;
-    const dz = (r() - 0.5) * FONT_SIZE * 0.5 * (PAGE_DEPTH / TEX);
-    pageToWorld(cur.x, cur.y, STONE_RADIUS, _home);
-    targets.push({
-      key: `cursor:${i}`,
-      homeX: _home.x + dx,
-      homeZ: _home.z + dz,
-      colorBase: STONE_CURSOR_BASE,
-      colorHi: STONE_CURSOR_HI,
-      colorT: r(),
-      scale: STONE_RADIUS * (0.7 + r() * 0.5),
-      rotX: (r() - 0.5) * 0.6,
-      rotY: (r() - 0.5) * 0.6,
-      rotZ: r() * Math.PI * 2,
-      delay: r() * 0.2,
-      dropExtra: r() * 0.15,
-      kickX: r() - 0.5,
-      kickZ: r() - 0.5,
-      restitution: 0.30 + r() * 0.10,
-    });
-  }
 }
 
 // ------------------------------------------------------------------
-// 8. Match targets → existing stones, spawn / mark-dying, integrate
-//    physics, write to the InstancedMesh.
+// 3. three.js: top-down-ish view of a horizontal page. The page is
+//    a displaced heightmap; the rocks are an InstancedMesh whose
+//    instance matrices are driven by Rapier each frame.
 // ------------------------------------------------------------------
-function step(dt) {
-  buildTargets();
+const stage = document.getElementById("stage");
+const renderer = new THREE.WebGLRenderer({ canvas: stage, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight, false);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-  seenKeys.clear();
-  for (const t of targets) {
-    let s = stoneState.get(t.key);
-    if (!s) {
-      // New stone — drop in from a small height above its home,
-      // with a randomised spawn delay so the whole letter doesn't
-      // hit the table at the same instant.
-      s = {
-        pos: new THREE.Vector3(
-          t.homeX + t.kickX * STONE_RADIUS * 0.6,
-          STONE_RADIUS + DROP_HEIGHT + t.dropExtra,
-          t.homeZ + t.kickZ * STONE_RADIUS * 0.6,
-        ),
-        vel: new THREE.Vector3(0, 0, 0),
-        homeX: t.homeX,
-        homeZ: t.homeZ,
-        rotX: t.rotX,
-        rotY: t.rotY,
-        rotZ: t.rotZ,
-        scale: t.scale,
-        colorBase: t.colorBase,
-        colorHi: t.colorHi,
-        colorT: t.colorT,
-        restitution: t.restitution,
-        delay: t.delay,
-        age: 0,
-        atRest: false,
-        dying: false,
-      };
-      stoneState.set(t.key, s);
-    } else {
-      s.homeX = t.homeX;
-      s.homeZ = t.homeZ;
-      s.colorBase = t.colorBase;
-      s.colorHi = t.colorHi;
-      s.scale = t.scale;
-      s.dying = false;
-    }
-    seenKeys.add(t.key);
+const scene = new THREE.Scene();
+// Background colour matches the ground so the page never reads as
+// a slab floating against a different-coloured sky on wide windows.
+scene.background = new THREE.Color(GROUND_HEX);
+scene.fog = new THREE.Fog(GROUND_HEX, 10, 22);
+
+// Soft hemisphere fill, plus a low key sun that casts shadows. The
+// raking sun is what makes the rocks read as rocks rather than as
+// flat circles — it gives each one a visible shadow on the ground.
+scene.add(new THREE.HemisphereLight(0xfff4d4, GROUND_DEEP_HEX, 0.55));
+const sun = new THREE.DirectionalLight(0xfff3c8, 1.4);
+sun.position.set(4.5, 7.0, 3.2);
+sun.castShadow = true;
+sun.shadow.camera.left = -6;
+sun.shadow.camera.right = 6;
+sun.shadow.camera.top = 6;
+sun.shadow.camera.bottom = -6;
+sun.shadow.camera.near = 0.5;
+sun.shadow.camera.far = 22;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.bias = -0.0008;
+scene.add(sun);
+
+// Page geometry. The Rapier heightfield is in *world space*; the
+// visual mesh has the same dimensions so the two stay in lockstep.
+const PAGE_SIZE = 7.0;
+const INDENT_DEPTH = 0.30;
+
+// Camera: looking down at an angle so we can see both the rock pile
+// and the surface they're forming.
+const CAMERA_DIST = 6.0;
+const CAMERA_TILT = 0.40; // radians forward of straight-down
+const camera = new THREE.PerspectiveCamera(
+  42,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  60,
+);
+function placeCamera() {
+  // Camera orbits around (0, 0, 0) at distance CAMERA_DIST, tilted
+  // CAMERA_TILT forward (so the bottom of the page is closer).
+  const y = Math.cos(CAMERA_TILT) * CAMERA_DIST;
+  const z = Math.sin(CAMERA_TILT) * CAMERA_DIST;
+  camera.position.set(0, y, z);
+  camera.lookAt(0, 0, 0);
+}
+placeCamera();
+
+// ------------------------------------------------------------------
+// 4. Terrain — a high-subdivision plane and a matching Rapier
+//    heightfield. Both are rebuilt whenever the document changes.
+// ------------------------------------------------------------------
+
+// Plane is in XY local (default). After rotating -π/2 around X, the
+// plane lies in the XZ world plane. We want the canvas's (cx, cy)
+// to map to world (worldX, worldZ); canvas Y top→bottom becomes
+// world Z back→front so the top of the document is at world -Z
+// (farther from camera).
+const MESH_RES = HMAP_RES; // share vertex resolution with the heightfield
+const planeGeo = new THREE.PlaneGeometry(
+  PAGE_SIZE,
+  PAGE_SIZE,
+  MESH_RES - 1,
+  MESH_RES - 1,
+);
+planeGeo.rotateX(-Math.PI / 2);
+// PlaneGeometry's default v=0 is at the bottom of the plane; after
+// rotateX(-π/2) the bottom-of-plane maps to world +Z. We want canvas
+// y=0 (top of doc) to be at world -Z, so we flip v in the geometry.
+{
+  const uvs = planeGeo.attributes.uv.array;
+  for (let i = 1; i < uvs.length; i += 2) uvs[i] = 1.0 - uvs[i];
+  planeGeo.attributes.uv.needsUpdate = true;
+}
+
+// We don't bake heights into the plane geometry permanently — the
+// shader samples a height texture. That way "rebuilding terrain"
+// only updates the texture; no buffer uploads on the JS side.
+const heightTexData = new Float32Array(HMAP_RES * HMAP_RES);
+const heightTex = new THREE.DataTexture(
+  heightTexData,
+  HMAP_RES,
+  HMAP_RES,
+  THREE.RedFormat,
+  THREE.FloatType,
+);
+heightTex.minFilter = THREE.LinearFilter;
+heightTex.magFilter = THREE.LinearFilter;
+heightTex.wrapS = THREE.ClampToEdgeWrapping;
+heightTex.wrapT = THREE.ClampToEdgeWrapping;
+
+// We also pass a small selection-tint texture so the shader can
+// brush in a warm wash where the user has a selection range.
+const selectionTexData = new Uint8Array(HMAP_RES * HMAP_RES);
+const selectionTex = new THREE.DataTexture(
+  selectionTexData,
+  HMAP_RES,
+  HMAP_RES,
+  THREE.RedFormat,
+  THREE.UnsignedByteType,
+);
+selectionTex.minFilter = THREE.LinearFilter;
+selectionTex.magFilter = THREE.LinearFilter;
+
+const groundMat = new THREE.MeshStandardMaterial({
+  color: new THREE.Color(GROUND_HEX),
+  roughness: 0.95,
+  metalness: 0.0,
+});
+// Patch the standard material so the vertex shader can read our
+// height texture and displace along +Y. (Easier than writing a
+// fully custom shader — we still get PBR shading and shadow maps.)
+groundMat.onBeforeCompile = (shader) => {
+  shader.uniforms.uHeight = { value: heightTex };
+  shader.uniforms.uSelection = { value: selectionTex };
+  shader.uniforms.uIndentDepth = { value: INDENT_DEPTH };
+  shader.uniforms.uShade = { value: new THREE.Color(GROUND_DEEP_HEX) };
+  shader.uniforms.uSelectTint = { value: new THREE.Color(ROCK_SELECT_HEX) };
+
+  shader.vertexShader =
+    `
+    uniform sampler2D uHeight;
+    uniform float uIndentDepth;
+    varying float vH;
+    varying vec2 vAtlasUv;
+    ` + shader.vertexShader;
+
+  shader.vertexShader = shader.vertexShader.replace(
+    "#include <begin_vertex>",
+    `
+      vec3 transformed = position;
+      vAtlasUv = uv;
+      float h = texture2D(uHeight, uv).r;
+      vH = h;
+      transformed.y -= h * uIndentDepth;
+    `,
+  );
+
+  shader.fragmentShader =
+    `
+    uniform sampler2D uSelection;
+    uniform vec3 uShade;
+    uniform vec3 uSelectTint;
+    varying float vH;
+    varying vec2 vAtlasUv;
+    ` + shader.fragmentShader;
+
+  shader.fragmentShader = shader.fragmentShader.replace(
+    "#include <color_fragment>",
+    `
+      #include <color_fragment>
+      // Deepen the colour inside indents — they read as shadowed
+      // troughs even before any rocks have fallen in.
+      diffuseColor.rgb = mix(diffuseColor.rgb, uShade, vH * 0.65);
+      float sel = texture2D(uSelection, vAtlasUv).r;
+      diffuseColor.rgb = mix(diffuseColor.rgb, uSelectTint * 0.85, sel * 0.55);
+    `,
+  );
+};
+const ground = new THREE.Mesh(planeGeo, groundMat);
+ground.receiveShadow = true;
+scene.add(ground);
+
+// A larger "off-page" plane behind the active heightfield. Same
+// material colour so the seam disappears; this is what fills the
+// monitor when the viewport is wider than the heightfield.
+const outerGround = new THREE.Mesh(
+  new THREE.PlaneGeometry(PAGE_SIZE * 4, PAGE_SIZE * 4),
+  new THREE.MeshStandardMaterial({
+    color: new THREE.Color(GROUND_HEX),
+    roughness: 0.97,
+  }),
+);
+outerGround.rotation.x = -Math.PI / 2;
+// Sit below the deepest indent so it never occludes the heightfield
+// from the camera's angle — only visible *past* the page edges.
+outerGround.position.y = -INDENT_DEPTH - 0.15;
+outerGround.receiveShadow = true;
+scene.add(outerGround);
+
+// ------------------------------------------------------------------
+// 5. Rapier world + terrain collider.
+// ------------------------------------------------------------------
+const world = new RAPIER.World({ x: 0, y: -12.0, z: 0 });
+world.integrationParameters.dt = 1 / 60;
+
+const terrainBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+let terrainCollider = null;
+
+// Walls around the page so rocks don't escape sideways. Four thin
+// vertical bars at the page edges, height tall enough to catch even
+// bouncing rocks.
+{
+  const w = 0.05;
+  const h = 1.5;
+  const s = PAGE_SIZE / 2;
+  const wallBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+  const sides = [
+    { hx: s + w, hy: h, hz: w, tx: 0, ty: h, tz:  s + w },
+    { hx: s + w, hy: h, hz: w, tx: 0, ty: h, tz: -s - w },
+    { hx: w, hy: h, hz: s + w, tx:  s + w, ty: h, tz: 0 },
+    { hx: w, hy: h, hz: s + w, tx: -s - w, ty: h, tz: 0 },
+  ];
+  for (const side of sides) {
+    const cd = RAPIER.ColliderDesc.cuboid(side.hx, side.hy, side.hz)
+      .setTranslation(side.tx, side.ty, side.tz)
+      .setFriction(0.4);
+    world.createCollider(cd, wallBody);
   }
+}
 
-  for (const [k, s] of stoneState) {
-    if (!seenKeys.has(k) && !s.dying) {
-      // Cut from the lateral spring and kick outward + up. They fall
-      // through the page (no surface collision while dying) and out
-      // of view.
-      s.dying = true;
-      const ang = Math.random() * Math.PI * 2;
-      s.vel.x = Math.cos(ang) * (1.4 + Math.random() * 0.8);
-      s.vel.z = Math.sin(ang) * (1.4 + Math.random() * 0.8);
-      s.vel.y = 1.6 + Math.random() * 0.8;
-    }
-  }
+// The heights array Rapier expects is laid out so heights[i + j*nrows]
+// is the height of the vertex at local-X index i, local-Z index j.
+// Their heightfield is centered on the body's origin and extends
+// scale.x in X, scale.z in Z; heights are in *units of scale.y*.
+//
+// Our canvas atlas has y=0 at the top of the doc. The plane's UV
+// maps top-of-doc to v=1 (after our uv flip). The HEIGHTFIELD's
+// local Z axis: we want world -Z to be "top of doc", which means
+// the Rapier vertex at j=0 corresponds to world -Z extreme, which
+// is canvas y=0.
+function rebuildHeightfield() {
+  renderTextToCanvas();
+  sctx.fillStyle = "#000";
+  sctx.fillRect(0, 0, HMAP_RES, HMAP_RES);
+  sctx.drawImage(texCanvas, 0, 0, HMAP_RES, HMAP_RES);
+  const data = sctx.getImageData(0, 0, HMAP_RES, HMAP_RES).data;
 
-  for (const [k, s] of stoneState) {
-    s.age += dt;
+  // Build two arrays:
+  //   - heightTexData: for the visual mesh's vertex displacement.
+  //     Indexed by (row, col) where (0,0) is top-left of canvas.
+  //   - heights: for Rapier. Rapier's index order in 3D is i + j*nrows,
+  //     and j corresponds to local Z. So vertex (i, j) lives at
+  //     world position roughly (i*dx, h, j*dz) before the body
+  //     transform.
+  const nrows = HMAP_RES;
+  const ncols = HMAP_RES;
+  const heights = new Float32Array(nrows * ncols);
 
-    // Pending — still in the air on its spawn delay. Hide but don't
-    // integrate. (We render with scale 0 below.)
-    if (!s.dying && s.age < s.delay) continue;
-
-    if (s.dying) {
-      s.vel.y += GRAVITY * dt;
-      s.pos.addScaledVector(s.vel, dt);
-      s.rotX += s.vel.z * dt * 2.4;
-      s.rotZ += s.vel.x * dt * 2.4;
-      if (s.pos.y < -3) stoneState.delete(k);
-      continue;
-    }
-
-    // Live stone physics.
-    //  - Vertical: gravity + hard bounce on y = STONE_RADIUS.
-    //  - Horizontal: a soft spring to (homeX, homeZ) so layout
-    //    shifts produce a slide, not a teleport.
-    s.vel.y += GRAVITY * dt;
-    s.pos.y += s.vel.y * dt;
-    if (s.pos.y < STONE_RADIUS) {
-      s.pos.y = STONE_RADIUS;
-      if (s.vel.y < -SETTLE_VEL) {
-        s.vel.y = -s.vel.y * s.restitution;
-        // friction on landing — kills lateral skid
-        s.vel.x *= 0.55;
-        s.vel.z *= 0.55;
-        // tumble a little on impact
-        s.rotX += s.vel.z * 0.3;
-        s.rotZ -= s.vel.x * 0.3;
-      } else {
-        s.vel.y = 0;
-        s.atRest = true;
+  // Sample with a small box-blur so the indents have soft walls.
+  function sampleSmoothed(cx, cy) {
+    let acc = 0;
+    let cnt = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const x = Math.max(0, Math.min(HMAP_RES - 1, cx + dx));
+        const y = Math.max(0, Math.min(HMAP_RES - 1, cy + dy));
+        acc += data[(y * HMAP_RES + x) * 4]; // R channel
+        cnt++;
       }
-    } else {
-      s.atRest = false;
     }
-
-    const dxh = s.homeX - s.pos.x;
-    const dzh = s.homeZ - s.pos.z;
-    s.vel.x += (LATERAL_K * dxh - LATERAL_DAMP * s.vel.x) * dt;
-    s.vel.z += (LATERAL_K * dzh - LATERAL_DAMP * s.vel.z) * dt;
-    s.pos.x += s.vel.x * dt;
-    s.pos.z += s.vel.z * dt;
+    return acc / cnt / 255.0; // 0..1
   }
 
-  // Write to InstancedMesh.
-  let i = 0;
-  const tNow = clock.getElapsedTime();
-  const cursorPulse = 1.0 + 0.16 * Math.sin(tNow * 4.5);
+  for (let cy = 0; cy < HMAP_RES; cy++) {
+    for (let cx = 0; cx < HMAP_RES; cx++) {
+      const v = sampleSmoothed(cx, cy);
+      heightTexData[cy * HMAP_RES + cx] = v;
 
-  for (const [k, s] of stoneState) {
-    if (i >= MAX_STONES) break;
-    const isCursor = k.startsWith("cursor:");
-    const pending = !s.dying && s.age < s.delay;
-
-    if (pending) {
-      // Render at zero scale (effectively invisible) until the
-      // spawn delay elapses; this keeps the slot live in the
-      // InstancedMesh but produces no on-screen blip.
-      dummy.position.set(0, -100, 0);
-      dummy.rotation.set(0, 0, 0);
-      dummy.scale.setScalar(0.0001);
-      dummy.updateMatrix();
-      stones.setMatrixAt(i, dummy.matrix);
-      dummyColor.setRGB(0, 0, 0);
-      stones.setColorAt(i, dummyColor);
-      i++;
-      continue;
+      // Rapier index: i = cx (X), j corresponds to local-Z. We want
+      // canvas y=0 to map to world -Z (j=0 in Rapier local frame).
+      // Rapier local Z runs -scale.z/2 to +scale.z/2 as j goes 0..ncols-1.
+      // So j = cy (top of canvas = top/back of world).
+      heights[cx + cy * nrows] = v;
     }
-
-    const scaleMul = isCursor ? cursorPulse : 1.0;
-    dummy.position.copy(s.pos);
-    dummy.rotation.set(s.rotX, s.rotY, s.rotZ);
-    dummy.scale.setScalar(s.scale * scaleMul);
-    dummy.updateMatrix();
-    stones.setMatrixAt(i, dummy.matrix);
-
-    dummyColor.copy(s.colorBase).lerp(s.colorHi, s.colorT * 0.7);
-    if (s.dying) dummyColor.multiplyScalar(0.85);
-    stones.setColorAt(i, dummyColor);
-
-    i++;
   }
-  stones.count = i;
-  stones.instanceMatrix.needsUpdate = true;
-  if (stones.instanceColor) stones.instanceColor.needsUpdate = true;
+  heightTex.needsUpdate = true;
+
+  if (terrainCollider) {
+    world.removeCollider(terrainCollider, false);
+  }
+  const hfDesc = RAPIER.ColliderDesc.heightfield(
+    nrows - 1,
+    ncols - 1,
+    heights,
+    { x: PAGE_SIZE, y: INDENT_DEPTH, z: PAGE_SIZE },
+  )
+    .setFriction(0.85)
+    .setRestitution(0.05);
+  // Heightfield sits with its surface at y=0 (and dips down into
+  // negative Y). Rapier's heightfield is centered on the rigid
+  // body; we want indents to be below y=0, so its centre is at
+  // y = -INDENT_DEPTH/2 + (1-mean) * INDENT_DEPTH ... easier to
+  // just sink the body by INDENT_DEPTH so the un-indented portion
+  // of the heightfield is at y=0.
+  hfDesc.setTranslation(0, -INDENT_DEPTH, 0);
+  terrainCollider = world.createCollider(hfDesc, terrainBody);
 }
 
 // ------------------------------------------------------------------
-// 9. Camera tracking. The camera glides over the page in XZ,
-//    keeping the caret near the centre. Clamped so the visible
-//    window stays inside the page bounds.
+// 6. Selection tint. Re-rasterise the doc with the selection range
+//    only (no glyphs) into a separate canvas, downsample to the
+//    selection texture so the ground shader can find it.
 // ------------------------------------------------------------------
-let camTargetX = 0;
-let camTargetZ = 0;
+const selectionCanvas = document.createElement("canvas");
+selectionCanvas.width = TEX;
+selectionCanvas.height = TEX;
+const selectionCtx = selectionCanvas.getContext("2d");
 
-function updateCamera() {
-  // Half the visible width/depth at the camera's height — used to
-  // clamp the tracking target so we never see past a page edge.
-  const halfFovV = (camera.fov * 0.5 * Math.PI) / 180;
-  const halfH = Math.tan(halfFovV) * CAMERA_HEIGHT;
-  const halfW = halfH * camera.aspect;
-
-  const margin = 0.1;
-  const maxX = PAGE_WIDTH * 0.5 - halfW + margin;
-  const minX = -maxX;
-  const maxZ = PAGE_DEPTH * 0.5 - halfH + margin;
-  const minZ = -maxZ;
-
-  let tx = Math.min(Math.max(cursorWorldX, minX), maxX);
-  let tz = Math.min(Math.max(cursorWorldZ, minZ), maxZ);
-  if (maxX < minX) tx = 0; // viewport bigger than page — just centre
-  if (maxZ < minZ) tz = 0;
-
-  camTargetX += (tx - camTargetX) * 0.10;
-  camTargetZ += (tz - camTargetZ) * 0.10;
-  camera.position.set(camTargetX, CAMERA_HEIGHT, camTargetZ);
-  camera.lookAt(camTargetX, 0, camTargetZ);
+function rebuildSelectionTint() {
+  selectionCtx.fillStyle = "#000";
+  selectionCtx.fillRect(0, 0, TEX, TEX);
+  const sel = view.state.selection.main;
+  if (sel.from !== sel.to) {
+    selectionCtx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+    selectionCtx.textBaseline = "alphabetic";
+    selectionCtx.fillStyle = "#fff";
+    const selFrom = Math.min(sel.from, sel.to);
+    const selTo = Math.max(sel.from, sel.to);
+    let y = PADDING;
+    for (let r = scrollTopRow; r < visualRows.length; r++) {
+      const row = visualRows[r];
+      if (selTo > row.startDocPos && selFrom <= row.endDocPos) {
+        const startCol = Math.max(0, selFrom - row.startDocPos);
+        const endCol = Math.min(row.text.length, selTo - row.startDocPos);
+        const x1 = PADDING + selectionCtx.measureText(row.text.slice(0, startCol)).width;
+        const x2 = PADDING + selectionCtx.measureText(row.text.slice(0, endCol)).width;
+        const extendsPastRow = selTo > row.endDocPos;
+        const xEnd = extendsPastRow ? TEX - PADDING : Math.max(x2, x1 + 20);
+        selectionCtx.fillRect(x1, y, xEnd - x1, FONT_SIZE);
+      }
+      y += LINE_HEIGHT;
+      if (y > TEX - PADDING) break;
+    }
+  }
+  // Downsample into the data texture.
+  const tmp = document.createElement("canvas");
+  tmp.width = HMAP_RES;
+  tmp.height = HMAP_RES;
+  const tctx2 = tmp.getContext("2d");
+  tctx2.drawImage(selectionCanvas, 0, 0, HMAP_RES, HMAP_RES);
+  const d = tctx2.getImageData(0, 0, HMAP_RES, HMAP_RES).data;
+  for (let i = 0; i < HMAP_RES * HMAP_RES; i++) {
+    selectionTexData[i] = d[i * 4];
+  }
+  selectionTex.needsUpdate = true;
 }
 
 // ------------------------------------------------------------------
-// 10. Pointer hit testing — raycast the page plane, recover UV,
-//     walk visualRows + measureText to get a doc position.
+// 7. Rocks. Pool of dynamic Rapier bodies + InstancedMesh visuals.
+//    Rocks are spawned slowly while the population is below a cap;
+//    once a rock leaves the play area or sinks under the page it's
+//    despawned and its slot becomes eligible for reuse.
+// ------------------------------------------------------------------
+const MAX_ROCKS = 1800;
+const ROCK_R = 0.06;
+
+// Slightly squashed icosahedra so they don't all look like perfect
+// balls — gives the pile a more pebbly silhouette.
+const rockGeo = new THREE.IcosahedronGeometry(ROCK_R, 0);
+const rockMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff,
+  roughness: 0.86,
+  metalness: 0.04,
+});
+const rocks = new THREE.InstancedMesh(rockGeo, rockMat, MAX_ROCKS);
+rocks.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+rocks.castShadow = true;
+rocks.receiveShadow = true;
+rocks.count = 0;
+{
+  const colors = new Float32Array(MAX_ROCKS * 3);
+  rocks.instanceColor = new THREE.InstancedBufferAttribute(colors, 3);
+  rocks.instanceColor.setUsage(THREE.DynamicDrawUsage);
+}
+scene.add(rocks);
+
+const rockBodies = []; // parallel to rocks[i]
+const dummy = new THREE.Object3D();
+const dummyColor = new THREE.Color();
+const baseRock = new THREE.Color(ROCK_BASE_HEX);
+const hiRock = new THREE.Color(ROCK_HI_HEX);
+const selRock = new THREE.Color(ROCK_SELECT_HEX);
+
+function spawnRock() {
+  if (rockBodies.length >= MAX_ROCKS) return;
+  // Spawn slightly above the page, with a small random spread, and
+  // a touch of horizontal velocity for visual interest.
+  const x = (Math.random() - 0.5) * (PAGE_SIZE * 0.95);
+  const z = (Math.random() - 0.5) * (PAGE_SIZE * 0.95);
+  const y = 2.0 + Math.random() * 0.6;
+
+  const rbDesc = RAPIER.RigidBodyDesc.dynamic()
+    .setTranslation(x, y, z)
+    .setLinvel(
+      (Math.random() - 0.5) * 0.4,
+      0,
+      (Math.random() - 0.5) * 0.4,
+    )
+    .setAngvel({
+      x: (Math.random() - 0.5) * 3,
+      y: (Math.random() - 0.5) * 3,
+      z: (Math.random() - 0.5) * 3,
+    })
+    // Continuous collision detection — without it, fast rocks
+    // tunnel through the thin heightfield and disappear underneath.
+    .setCcdEnabled(true);
+  const rb = world.createRigidBody(rbDesc);
+
+  // Vary radius slightly per rock for visual texture.
+  const rScale = 0.7 + Math.random() * 0.7;
+  const cd = RAPIER.ColliderDesc.ball(ROCK_R * rScale)
+    .setFriction(0.95)
+    .setRestitution(0.08)
+    .setDensity(2.0);
+  world.createCollider(cd, rb);
+
+  rb.__rockTint = Math.random();
+  rb.__rockScale = rScale;
+  rockBodies.push(rb);
+}
+
+function despawnRock(i) {
+  const rb = rockBodies[i];
+  world.removeRigidBody(rb);
+  // Swap-remove
+  rockBodies[i] = rockBodies[rockBodies.length - 1];
+  rockBodies.pop();
+}
+
+// ------------------------------------------------------------------
+// 8. Pointer hit testing. Raycast the (un-displaced) ground plane
+//    to recover an atlas position the same way the other demos do.
 // ------------------------------------------------------------------
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
+const flatPlane = new THREE.Mesh(
+  new THREE.PlaneGeometry(PAGE_SIZE, PAGE_SIZE, 1, 1),
+  new THREE.MeshBasicMaterial({ visible: false }),
+);
+flatPlane.rotation.x = -Math.PI / 2;
+scene.add(flatPlane);
 
 function docPosFromPointer(event) {
   ndc.x = (event.clientX / window.innerWidth) * 2 - 1;
   ndc.y = -(event.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(ndc, camera);
-  const hits = raycaster.intersectObject(ground);
+  const hits = raycaster.intersectObject(flatPlane);
   if (!hits.length || !hits[0].uv) return null;
 
   const uv = hits[0].uv;
-  // PlaneGeometry default UVs: u=0 left, v=0 bottom. After we
-  // rotated the ground by -π/2 around X, vertex local-Y mapped to
-  // world -Z, so a world-space hit at z = -PAGE_DEPTH/2 hits the
-  // top of the original geometry → v=1. We invert to get canvas Y.
+  // uv was inverted on the visual mesh; the invisible hit plane uses
+  // the unflipped UV (v=0 at the bottom of the plane = world +Z =
+  // bottom of doc). Convert to canvas-y top-down.
   const px = uv.x * TEX;
   const py = (1 - uv.y) * TEX;
 
   if (visualRows.length === 0) return null;
-
   const rowOffset = Math.floor((py - PADDING) / LINE_HEIGHT);
   let rowIdx = scrollTopRow + rowOffset;
   if (rowIdx < 0) rowIdx = 0;
   if (rowIdx >= visualRows.length) rowIdx = visualRows.length - 1;
   const row = visualRows[rowIdx];
 
-  lctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+  setFont();
   const targetX = Math.max(0, px - PADDING);
   let col = row.text.length;
   let prevW = 0;
   for (let i = 1; i <= row.text.length; i++) {
-    const w = lctx.measureText(row.text.slice(0, i)).width;
+    const w = tctx.measureText(row.text.slice(0, i)).width;
     if (targetX < (prevW + w) / 2) {
       col = i - 1;
       break;
@@ -720,7 +699,7 @@ stageEl.addEventListener("pointerup", endDrag);
 stageEl.addEventListener("pointercancel", endDrag);
 
 // ------------------------------------------------------------------
-// 11. Resize + animation loop.
+// 9. Resize.
 // ------------------------------------------------------------------
 function resize() {
   const w = window.innerWidth;
@@ -732,23 +711,95 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-const clock = new THREE.Clock();
-function tick() {
-  const dt = Math.min(clock.getDelta(), 1 / 30);
-  step(dt);
-  updateCamera();
+// ------------------------------------------------------------------
+// 10. Animation loop.
+//
+//   - If the doc changed, rebuild the terrain heightfield + texture.
+//   - If only the selection changed, rebuild just the tint texture.
+//   - Spawn a few rocks per frame until we hit the population cap.
+//   - Step Rapier and copy each rock's pose into the InstancedMesh.
+//   - Despawn rocks that fell off the page.
+// ------------------------------------------------------------------
+let lastSpawn = 0;
+const SPAWN_INTERVAL = 0.012; // seconds between spawns (~80/sec)
+let spawnAcc = 0;
+
+function isInSelection(rb) {
+  // Project the rock's xz back into the canvas plane and read the
+  // selection texture. Cheap proxy — close enough for tint purposes.
+  const t = rb.translation();
+  const u = (t.x / PAGE_SIZE + 0.5) * HMAP_RES;
+  const v = (t.z / PAGE_SIZE + 0.5) * HMAP_RES;
+  const ui = Math.max(0, Math.min(HMAP_RES - 1, Math.floor(u)));
+  const vi = Math.max(0, Math.min(HMAP_RES - 1, Math.floor(v)));
+  return selectionTexData[vi * HMAP_RES + ui] > 32;
+}
+
+function tick(now) {
+  if (docDirty) {
+    rebuildHeightfield();
+    rebuildSelectionTint();
+    docDirty = false;
+    selectionDirty = false;
+  } else if (selectionDirty) {
+    rebuildSelectionTint();
+    selectionDirty = false;
+  }
+
+  const dt = 1 / 60;
+  spawnAcc += dt;
+  while (spawnAcc >= SPAWN_INTERVAL) {
+    spawnRock();
+    spawnAcc -= SPAWN_INTERVAL;
+  }
+
+  world.step();
+
+  // Cull rocks that ran out of bounds (off the page edge, under the
+  // floor) and copy survivors into the instance buffer.
+  let writeIdx = 0;
+  for (let i = rockBodies.length - 1; i >= 0; i--) {
+    const rb = rockBodies[i];
+    const t = rb.translation();
+    if (
+      t.y < -3 ||
+      Math.abs(t.x) > PAGE_SIZE * 0.7 ||
+      Math.abs(t.z) > PAGE_SIZE * 0.7
+    ) {
+      despawnRock(i);
+    }
+  }
+  for (let i = 0; i < rockBodies.length && writeIdx < MAX_ROCKS; i++) {
+    const rb = rockBodies[i];
+    const t = rb.translation();
+    const q = rb.rotation();
+    dummy.position.set(t.x, t.y, t.z);
+    dummy.quaternion.set(q.x, q.y, q.z, q.w);
+    dummy.scale.setScalar(rb.__rockScale);
+    dummy.updateMatrix();
+    rocks.setMatrixAt(writeIdx, dummy.matrix);
+
+    const tone = rb.__rockTint;
+    if (isInSelection(rb)) {
+      dummyColor.copy(selRock);
+    } else {
+      dummyColor.copy(baseRock).lerp(hiRock, tone * 0.7);
+    }
+    rocks.setColorAt(writeIdx, dummyColor);
+    writeIdx++;
+  }
+  rocks.count = writeIdx;
+  rocks.instanceMatrix.needsUpdate = true;
+  if (rocks.instanceColor) rocks.instanceColor.needsUpdate = true;
+
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
 
 document.fonts.load(`${FONT_SIZE}px "Bowlby One"`).then(() => {
-  for (const ch of initialDoc) {
-    if (ch !== " " && ch !== "\n" && ch !== "\t") getGlyph(ch);
-  }
-  // Snap camera to its initial target so we don't pan from (0,0) on
-  // the first frame.
-  buildTargets();
-  camTargetX = cursorWorldX;
-  camTargetZ = cursorWorldZ;
-  tick();
+  rebuildHeightfield();
+  rebuildSelectionTint();
+  docDirty = false;
+  selectionDirty = false;
+  requestAnimationFrame(tick);
 });
