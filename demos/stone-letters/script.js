@@ -5,8 +5,7 @@ import * as THREE from "https://esm.sh/three@0.160.0";
 // ------------------------------------------------------------------
 // 0. Palette.
 // ------------------------------------------------------------------
-const SKY_TOP_HEX = "#c9b58a";
-const SKY_BOTTOM_HEX = "#8d7848";
+const SKY_HEX = "#cdb98a";
 const GROUND_HEX = "#b9a376";
 
 const STONE_TEXT_BASE = new THREE.Color("#3a2f24");
@@ -17,13 +16,11 @@ const STONE_CURSOR_BASE = new THREE.Color("#f5b630");
 const STONE_CURSOR_HI = new THREE.Color("#fff0a8");
 
 // ------------------------------------------------------------------
-// 1. Hidden CodeMirror 6 editor. Stones live in world space and are
-//    keyed by `${docPos}:${glyphStoneIdx}`; when the doc changes we
-//    remap docPos through the change set so existing stones glide to
-//    their new homes instead of cascading.
+// 1. Hidden CodeMirror editor. Stones live in world space, keyed by
+//    `${docPos}:${glyphStoneIdx}`. An updateListener remaps docPos
+//    through the change set so mid-document edits don't cascade.
 // ------------------------------------------------------------------
 let stoneState = new Map();
-let dirty = true;
 
 const initialDoc = `STONES
 
@@ -41,36 +38,26 @@ const view = new EditorView({
     basicSetup,
     markdown(),
     EditorView.updateListener.of((u) => {
-      if (u.docChanged) {
-        // Walk the change set so each stone's char identity follows
-        // its character through inserts/deletes. Without this, any
-        // mid-document edit would re-key every following stone and
-        // the whole tail of the document would respawn.
-        const next = new Map();
-        for (const [key, stone] of stoneState) {
-          const colon = key.indexOf(":");
-          const head = key.slice(0, colon);
-          if (head === "cursor" || head === "orphan") {
-            next.set(key, stone);
-            continue;
-          }
-          const oldPos = parseInt(head, 10);
-          const newPos = u.changes.mapPos(oldPos, 1);
-          const newKey = `${newPos}:${key.slice(colon + 1)}`;
-          if (next.has(newKey)) {
-            // Collision: the character at oldPos was deleted and is
-            // colliding with a survivor. Push this stone into the
-            // dying pool with a unique key so it falls cleanly.
-            stone.dying = true;
-            next.set("orphan:" + Math.random().toString(36).slice(2), stone);
-          } else {
-            next.set(newKey, stone);
-          }
+      if (!u.docChanged) return;
+      const next = new Map();
+      for (const [key, stone] of stoneState) {
+        const colon = key.indexOf(":");
+        const head = key.slice(0, colon);
+        if (head === "cursor" || head === "orphan") {
+          next.set(key, stone);
+          continue;
         }
-        stoneState = next;
-        dirty = true;
+        const oldPos = parseInt(head, 10);
+        const newPos = u.changes.mapPos(oldPos, 1);
+        const newKey = `${newPos}:${key.slice(colon + 1)}`;
+        if (next.has(newKey)) {
+          stone.dying = true;
+          next.set("orphan:" + Math.random().toString(36).slice(2), stone);
+        } else {
+          next.set(newKey, stone);
+        }
       }
-      if (u.selectionSet) dirty = true;
+      stoneState = next;
     }),
   ],
   parent: document.getElementById("editor-host"),
@@ -79,13 +66,12 @@ const view = new EditorView({
 view.focus();
 
 // ------------------------------------------------------------------
-// 2. Layout-measurement canvas. We never actually rasterise the doc
-//    here — we only need measureText for word wrap and per-character
-//    advance. Glyph *pixels* come from the per-character cache below.
+// 2. Layout-measurement canvas. We only use it for measureText; the
+//    actual glyph pixels come from the per-character cache below.
 // ------------------------------------------------------------------
-const TEX = 1024;
-const FONT_SIZE = 100;
-const LINE_HEIGHT = 134;
+const TEX = 1536;
+const FONT_SIZE = 200;
+const LINE_HEIGHT = 260;
 const PADDING = 80;
 const FONT_FAMILY = '"Bowlby One", sans-serif';
 
@@ -156,21 +142,10 @@ function findCursorRow(rows, head) {
 }
 
 // ------------------------------------------------------------------
-// 3. Per-character glyph cache.
-//
-//    For each unique character we render the glyph once into a small
-//    canvas, then walk it on a jittered grid: each grid cell that
-//    contains an opaque pixel becomes one stone offset (with stable
-//    randomised scale, rotation, and tone). The stone cluster is
-//    keyed by the glyph's pixel shape, which is what makes a "B"
-//    look like a B and an "O" like an O.
-//
-//    The cache is keyed by character only — a Bowlby-One "a" is
-//    always the same shape, so the same offsets work everywhere it
-//    appears in the document. Per-instance variation comes from the
-//    docPos prefix on the stone key, not from the glyph cache.
+// 3. Per-character glyph cache. Rasterise once, walk on a jittered
+//    grid, store one stone offset per opaque cell. Cached forever.
 // ------------------------------------------------------------------
-const CACHE = 256;
+const CACHE = 384;
 const cacheCanvas = document.createElement("canvas");
 cacheCanvas.width = CACHE;
 cacheCanvas.height = CACHE;
@@ -188,7 +163,7 @@ function rng(seed) {
 }
 
 const glyphCache = new Map();
-const STRIDE = 5; // pixels between candidate stones in the cache canvas
+const STRIDE = 14; // ~60–90 stones per character in Bowlby One
 
 function getGlyph(ch) {
   const cached = glyphCache.get(ch);
@@ -200,7 +175,6 @@ function getGlyph(ch) {
   const advance = m.width;
   const ascent = (m.actualBoundingBoxAscent || FONT_SIZE * 0.85) | 0;
   const descent = (m.actualBoundingBoxDescent || FONT_SIZE * 0.25) | 0;
-
   const w = Math.max(1, Math.ceil(m.actualBoundingBoxRight ?? advance) + 2);
   const h = Math.max(1, ascent + descent + 2);
 
@@ -209,7 +183,6 @@ function getGlyph(ch) {
   cctx.fillText(ch, 1, ascent + 1);
 
   const img = cctx.getImageData(0, 0, w, h).data;
-
   const stones = [];
   let idx = 0;
   for (let gy = 0; gy < h - 1; gy += STRIDE) {
@@ -223,13 +196,22 @@ function getGlyph(ch) {
       const lit = img[i + 3] > 80 && img[i] + img[i + 1] + img[i + 2] < 250;
       if (lit) {
         stones.push({
-          x: px - 1, // canvas-pixel offset from glyph left
-          y: py - 1 - ascent, // canvas-pixel offset from baseline
+          x: px - 1,
+          y: py - 1 - ascent,
           scale: 0.55 + r() * 0.6,
           rotX: (r() - 0.5) * 0.7,
           rotY: (r() - 0.5) * 0.7,
           rotZ: r() * Math.PI * 2,
           colorT: r(),
+          // Cached pseudo-randomness consumed when the live stone
+          // spawns. r() must be called a stable number of times per
+          // cell so the per-pixel seed stays deterministic across
+          // calls.
+          delay: r() * 0.35,
+          dropExtra: r() * 0.25,
+          kickX: r() - 0.5,
+          kickZ: r() - 0.5,
+          restitution: 0.28 + r() * 0.12,
         });
       }
       idx++;
@@ -241,7 +223,9 @@ function getGlyph(ch) {
 }
 
 // ------------------------------------------------------------------
-// 4. three.js scene.
+// 4. three.js scene. Page is *horizontal* (XZ plane at y=0), camera
+//    is *straight down* from above, with horizontal tracking that
+//    glides the camera toward the caret each frame.
 // ------------------------------------------------------------------
 const stage = document.getElementById("stage");
 const renderer = new THREE.WebGLRenderer({ canvas: stage, antialias: true });
@@ -250,46 +234,13 @@ renderer.setSize(window.innerWidth, window.innerHeight, false);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(SKY_BOTTOM_HEX);
-scene.fog = new THREE.Fog(SKY_BOTTOM_HEX, 6, 14);
+scene.background = new THREE.Color(SKY_HEX);
+scene.fog = new THREE.Fog(SKY_HEX, 8, 18);
 
-// Sky dome.
-{
-  const skyGeo = new THREE.SphereGeometry(40, 32, 16);
-  const skyMat = new THREE.ShaderMaterial({
-    side: THREE.BackSide,
-    uniforms: {
-      uTop: { value: new THREE.Color(SKY_TOP_HEX) },
-      uBot: { value: new THREE.Color(SKY_BOTTOM_HEX) },
-    },
-    vertexShader: `
-      varying vec3 vPos;
-      void main() {
-        vPos = position;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: `
-      uniform vec3 uTop;
-      uniform vec3 uBot;
-      varying vec3 vPos;
-      void main() {
-        float h = clamp((vPos.y / 40.0) * 0.5 + 0.5, 0.0, 1.0);
-        gl_FragColor = vec4(mix(uBot, uTop, smoothstep(0.2, 0.95, h)), 1.0);
-      }
-    `,
-  });
-  scene.add(new THREE.Mesh(skyGeo, skyMat));
-}
+const PAGE_WIDTH = 8.0;
+const PAGE_DEPTH = 8.0;
 
-// Tilted page. Stones sit on (and above) this plane.
-const PAGE_WIDTH = 5.4;
-const PAGE_DEPTH = 5.4;
-const pageGroup = new THREE.Group();
-pageGroup.rotation.x = -1.05;
-pageGroup.position.set(0, 0.05, -0.4);
-scene.add(pageGroup);
-
+// Horizontal page in XZ plane.
 const groundGeo = new THREE.PlaneGeometry(PAGE_WIDTH, PAGE_DEPTH, 1, 1);
 const groundMat = new THREE.MeshStandardMaterial({
   color: new THREE.Color(GROUND_HEX),
@@ -297,38 +248,51 @@ const groundMat = new THREE.MeshStandardMaterial({
   metalness: 0.0,
 });
 const ground = new THREE.Mesh(groundGeo, groundMat);
-pageGroup.add(ground);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+scene.add(ground);
 
-// Lights.
-scene.add(new THREE.HemisphereLight(SKY_TOP_HEX, GROUND_HEX, 0.55));
+// Lights. Key light angled off-vertical so the stones have visible
+// shading from straight overhead. Hemisphere gives a soft fill so
+// the undersides of pebbles aren't pitch-black.
+scene.add(new THREE.HemisphereLight(0xfff4d4, GROUND_HEX, 0.55));
 {
-  const key = new THREE.DirectionalLight(0xfff1c4, 1.25);
-  key.position.set(2.2, 4.0, 2.5);
+  const key = new THREE.DirectionalLight(0xfff3c8, 1.2);
+  key.position.set(2.6, 5.0, 2.0);
   scene.add(key);
-
-  const rim = new THREE.DirectionalLight(0x9fb8d0, 0.35);
-  rim.position.set(-3.0, 2.5, -2.0);
+  const rim = new THREE.DirectionalLight(0x9fb8d0, 0.32);
+  rim.position.set(-3.0, 4.0, -2.5);
   scene.add(rim);
 }
 
+const CAMERA_HEIGHT = 9.0;
 const camera = new THREE.PerspectiveCamera(
-  38,
+  42,
   window.innerWidth / window.innerHeight,
-  0.05,
-  50,
+  0.1,
+  60,
 );
-camera.position.set(0, 1.55, 3.05);
-camera.lookAt(0, 0, -0.5);
-
-// Force pageGroup's matrixWorld to be current — we sample it below
-// when computing world-space stone homes from page-local positions.
+// World "up" on screen = -Z, so canvas-top (which maps to world
+// -Z after our pageToWorld) becomes the top of the screen.
+camera.up.set(0, 0, -1);
+camera.position.set(0, CAMERA_HEIGHT, 0);
+camera.lookAt(0, 0, 0);
 scene.updateMatrixWorld(true);
 
 // ------------------------------------------------------------------
-// 5. InstancedMesh of stones — one slot per live stone, regardless
-//    of which character they belong to.
+// 5. Page-canvas → world. Canvas Y runs top→bottom; we map that to
+//    world Z so the top of the document is at world -Z.
 // ------------------------------------------------------------------
-const MAX_STONES = 12000;
+function pageToWorld(canvasX, canvasY, lift, out) {
+  const u = canvasX / TEX;
+  const v = canvasY / TEX;
+  out.set((u - 0.5) * PAGE_WIDTH, lift, (v - 0.5) * PAGE_DEPTH);
+}
+
+// ------------------------------------------------------------------
+// 6. Stones — InstancedMesh, world space.
+// ------------------------------------------------------------------
+const MAX_STONES = 16000;
 const stoneGeo = new THREE.IcosahedronGeometry(1.0, 0);
 stoneGeo.scale(1.0, 0.78, 1.0);
 const stoneMat = new THREE.MeshStandardMaterial({
@@ -339,7 +303,7 @@ const stoneMat = new THREE.MeshStandardMaterial({
 const stones = new THREE.InstancedMesh(stoneGeo, stoneMat, MAX_STONES);
 stones.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 stones.count = 0;
-scene.add(stones); // lives in world space, NOT under pageGroup
+scene.add(stones);
 {
   const colors = new Float32Array(MAX_STONES * 3);
   stones.instanceColor = new THREE.InstancedBufferAttribute(colors, 3);
@@ -349,30 +313,47 @@ scene.add(stones); // lives in world space, NOT under pageGroup
 const dummy = new THREE.Object3D();
 const dummyColor = new THREE.Color();
 
-const STONE_RADIUS = (PAGE_WIDTH / TEX) * STRIDE * 0.78;
-const SPAWN_LIFT = 0.9; // world units a new stone falls from
+// Smaller stones than the previous version — about half the world
+// radius. With STRIDE=14 we get plenty of stones per character so
+// even at this size the letterforms remain readable.
+const STONE_RADIUS = 0.012;
 
-// Convert a (canvas-x, canvas-y, lift) page-local coord to world.
-const _scratch = new THREE.Vector3();
-function pageToWorld(canvasX, canvasY, lift, out) {
-  const u = canvasX / TEX;
-  const v = canvasY / TEX;
-  _scratch.set((u - 0.5) * PAGE_WIDTH, -(v - 0.5) * PAGE_DEPTH, lift);
-  _scratch.applyMatrix4(pageGroup.matrixWorld);
-  out.copy(_scratch);
+// Physics constants.
+const GRAVITY = -9.8;
+const DROP_HEIGHT = 0.4; // shallow — stones drop from ~half a glyph height
+const LATERAL_K = 6.0; // how strongly horizontal motion is pulled to home
+const LATERAL_DAMP = 5.0;
+const SETTLE_VEL = 0.08; // |vel.y| below this when on-surface → snap to rest
+
+// ------------------------------------------------------------------
+// 7. Build target list — one entry per stone that should exist this
+//    frame. Each target carries everything the integrator needs.
+// ------------------------------------------------------------------
+const targets = [];
+const seenKeys = new Set();
+const _home = new THREE.Vector3();
+
+let cursorWorldX = 0;
+let cursorWorldZ = 0;
+
+function computeCursorAtlasPos() {
+  const head = view.state.selection.main.head;
+  if (visualRows.length === 0) return { x: PADDING, y: PADDING };
+  const cursorRowIdx = findCursorRow(visualRows, head);
+  const row = visualRows[cursorRowIdx];
+  const yInRows = cursorRowIdx - scrollTopRow;
+  const yCanvas = PADDING + yInRows * LINE_HEIGHT + FONT_SIZE * 0.5;
+  const localCol = Math.min(
+    Math.max(0, head - row.startDocPos),
+    row.text.length,
+  );
+  lctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+  const wBefore = lctx.measureText(row.text.slice(0, localCol)).width;
+  return { x: PADDING + wBefore, y: yCanvas };
 }
 
-// ------------------------------------------------------------------
-// 6. Compute the per-frame target list — one entry per stone that
-//    should currently exist. The stoneState map then matches these
-//    targets against existing stones (re-using identity), spawns new
-//    ones, and marks dropped ones as dying.
-// ------------------------------------------------------------------
-const targetHome = new THREE.Vector3();
-
-function buildTargets(out) {
-  out.length = 0;
-
+function buildTargets() {
+  targets.length = 0;
   visualRows = computeLayout();
 
   const sel = view.state.selection.main;
@@ -388,9 +369,6 @@ function buildTargets(out) {
     scrollTopRow = cursorRowIdx - visibleRowCount + 1;
   if (scrollTopRow < 0) scrollTopRow = 0;
 
-  let cursorCanvasX = PADDING;
-  let cursorCanvasY = PADDING;
-
   let y = PADDING;
   for (let r = scrollTopRow; r < visualRows.length; r++) {
     const row = visualRows[r];
@@ -402,10 +380,6 @@ function buildTargets(out) {
 
       if (ch === " " || ch === "\t") {
         x += lctx.measureText(ch).width;
-        if (r === cursorRowIdx && docPos === head) {
-          cursorCanvasX = x;
-          cursorCanvasY = y + FONT_SIZE * 0.5;
-        }
         continue;
       }
 
@@ -413,21 +387,18 @@ function buildTargets(out) {
       const baseline = y + FONT_SIZE * 0.85;
       const inSel = hasRange && docPos >= selFrom && docPos < selTo;
 
-      if (r === cursorRowIdx && docPos === head) {
-        cursorCanvasX = x;
-        cursorCanvasY = y + FONT_SIZE * 0.5;
-      }
-
       for (let j = 0; j < entry.stones.length; j++) {
         const st = entry.stones[j];
         const cx = x + st.x;
         const cy = baseline + st.y;
-        const lift = STONE_RADIUS * (0.4 + st.colorT * 1.0);
-        pageToWorld(cx, cy, lift, targetHome);
+        // Home sits on the page surface — its Y is STONE_RADIUS so
+        // a resting stone's centre is one radius above the table.
+        pageToWorld(cx, cy, STONE_RADIUS, _home);
 
-        out.push({
+        targets.push({
           key: `${docPos}:${j}`,
-          home: targetHome.clone(),
+          homeX: _home.x,
+          homeZ: _home.z,
           colorBase: inSel ? STONE_SELECT_BASE : STONE_TEXT_BASE,
           colorHi: inSel ? STONE_SELECT_HI : STONE_TEXT_HI,
           colorT: st.colorT,
@@ -435,32 +406,37 @@ function buildTargets(out) {
           rotX: st.rotX,
           rotY: st.rotY,
           rotZ: st.rotZ,
+          delay: st.delay,
+          dropExtra: st.dropExtra,
+          kickX: st.kickX,
+          kickZ: st.kickZ,
+          restitution: st.restitution,
         });
       }
       x += entry.advance;
-    }
-
-    if (r === cursorRowIdx && head >= row.endDocPos) {
-      cursorCanvasX = x;
-      cursorCanvasY = y + FONT_SIZE * 0.5;
     }
     y += LINE_HEIGHT;
     if (y > TEX - PADDING) break;
   }
 
-  // Cursor: a small heap of bright stones at the caret position.
-  // Always present — no blink — because a blinking pile would be a
-  // distracting strobe. Pulse via a per-frame scale instead.
-  const CURSOR_STONE_COUNT = 9;
+  // Cursor — a small column of bright stones at the caret. They get
+  // the same drop physics as text stones, so when the cursor moves
+  // (or you first open the page) they fall in like everything else.
+  const cur = computeCursorAtlasPos();
+  pageToWorld(cur.x, cur.y, 0, _home);
+  cursorWorldX = _home.x;
+  cursorWorldZ = _home.z;
+
+  const CURSOR_STONE_COUNT = 14;
   for (let i = 0; i < CURSOR_STONE_COUNT; i++) {
     const r = rng(pixelSeed(2718281, i));
-    const jx = (r() - 0.5) * STONE_RADIUS * 1.6;
-    const jy = (r() - 0.5) * FONT_SIZE * 0.45;
-    const lift = STONE_RADIUS * (0.5 + r() * 1.2);
-    pageToWorld(cursorCanvasX + jx, cursorCanvasY + jy, lift, targetHome);
-    out.push({
+    const dx = (r() - 0.5) * STONE_RADIUS * 1.8;
+    const dz = (r() - 0.5) * FONT_SIZE * 0.5 * (PAGE_DEPTH / TEX);
+    pageToWorld(cur.x, cur.y, STONE_RADIUS, _home);
+    targets.push({
       key: `cursor:${i}`,
-      home: targetHome.clone(),
+      homeX: _home.x + dx,
+      homeZ: _home.z + dz,
       colorBase: STONE_CURSOR_BASE,
       colorHi: STONE_CURSOR_HI,
       colorT: r(),
@@ -468,34 +444,38 @@ function buildTargets(out) {
       rotX: (r() - 0.5) * 0.6,
       rotY: (r() - 0.5) * 0.6,
       rotZ: r() * Math.PI * 2,
+      delay: r() * 0.2,
+      dropExtra: r() * 0.15,
+      kickX: r() - 0.5,
+      kickZ: r() - 0.5,
+      restitution: 0.30 + r() * 0.10,
     });
   }
 }
 
 // ------------------------------------------------------------------
-// 7. Match targets → existing stones; spawn / mark-dying as needed;
-//    integrate physics; write to InstancedMesh.
+// 8. Match targets → existing stones, spawn / mark-dying, integrate
+//    physics, write to the InstancedMesh.
 // ------------------------------------------------------------------
-const SPRING_K = 36;
-const DAMP = 7.5;
-const GRAVITY = -9.8;
-const targets = [];
-const seenKeys = new Set();
-const _tmpVec = new THREE.Vector3();
-
 function step(dt) {
-  buildTargets(targets);
+  buildTargets();
 
   seenKeys.clear();
   for (const t of targets) {
     let s = stoneState.get(t.key);
     if (!s) {
-      // New stone — spawn above its home with zero velocity. The
-      // spring will pull it down; damping will catch it.
+      // New stone — drop in from a small height above its home,
+      // with a randomised spawn delay so the whole letter doesn't
+      // hit the table at the same instant.
       s = {
-        pos: t.home.clone().add(_tmpVec.set(0, SPAWN_LIFT, 0)),
-        vel: new THREE.Vector3(),
-        home: t.home.clone(),
+        pos: new THREE.Vector3(
+          t.homeX + t.kickX * STONE_RADIUS * 0.6,
+          STONE_RADIUS + DROP_HEIGHT + t.dropExtra,
+          t.homeZ + t.kickZ * STONE_RADIUS * 0.6,
+        ),
+        vel: new THREE.Vector3(0, 0, 0),
+        homeX: t.homeX,
+        homeZ: t.homeZ,
         rotX: t.rotX,
         rotY: t.rotY,
         rotZ: t.rotZ,
@@ -503,11 +483,16 @@ function step(dt) {
         colorBase: t.colorBase,
         colorHi: t.colorHi,
         colorT: t.colorT,
+        restitution: t.restitution,
+        delay: t.delay,
+        age: 0,
+        atRest: false,
         dying: false,
       };
       stoneState.set(t.key, s);
     } else {
-      s.home.copy(t.home);
+      s.homeX = t.homeX;
+      s.homeZ = t.homeZ;
       s.colorBase = t.colorBase;
       s.colorHi = t.colorHi;
       s.scale = t.scale;
@@ -516,47 +501,93 @@ function step(dt) {
     seenKeys.add(t.key);
   }
 
-  // Anything not seen this frame is being deleted. Cut it loose from
-  // its spring; gravity will take it from there.
   for (const [k, s] of stoneState) {
     if (!seenKeys.has(k) && !s.dying) {
+      // Cut from the lateral spring and kick outward + up. They fall
+      // through the page (no surface collision while dying) and out
+      // of view.
       s.dying = true;
-      // a tiny outward kick so they tumble rather than just plummet
-      s.vel.x += (Math.random() - 0.5) * 0.6;
-      s.vel.z += (Math.random() - 0.5) * 0.6;
-      s.vel.y += 0.4 + Math.random() * 0.4;
+      const ang = Math.random() * Math.PI * 2;
+      s.vel.x = Math.cos(ang) * (1.4 + Math.random() * 0.8);
+      s.vel.z = Math.sin(ang) * (1.4 + Math.random() * 0.8);
+      s.vel.y = 1.6 + Math.random() * 0.8;
     }
   }
 
-  // Integrate.
   for (const [k, s] of stoneState) {
+    s.age += dt;
+
+    // Pending — still in the air on its spawn delay. Hide but don't
+    // integrate. (We render with scale 0 below.)
+    if (!s.dying && s.age < s.delay) continue;
+
     if (s.dying) {
       s.vel.y += GRAVITY * dt;
       s.pos.addScaledVector(s.vel, dt);
-      // tumble
-      s.rotX += s.vel.z * dt * 0.8;
-      s.rotZ += s.vel.x * dt * 0.8;
-      if (s.pos.y < -2.5) stoneState.delete(k);
-    } else {
-      const dx = s.home.x - s.pos.x;
-      const dy = s.home.y - s.pos.y;
-      const dz = s.home.z - s.pos.z;
-      s.vel.x += (SPRING_K * dx - DAMP * s.vel.x) * dt;
-      s.vel.y += (SPRING_K * dy - DAMP * s.vel.y) * dt;
-      s.vel.z += (SPRING_K * dz - DAMP * s.vel.z) * dt;
-      s.pos.addScaledVector(s.vel, dt);
+      s.rotX += s.vel.z * dt * 2.4;
+      s.rotZ += s.vel.x * dt * 2.4;
+      if (s.pos.y < -3) stoneState.delete(k);
+      continue;
     }
+
+    // Live stone physics.
+    //  - Vertical: gravity + hard bounce on y = STONE_RADIUS.
+    //  - Horizontal: a soft spring to (homeX, homeZ) so layout
+    //    shifts produce a slide, not a teleport.
+    s.vel.y += GRAVITY * dt;
+    s.pos.y += s.vel.y * dt;
+    if (s.pos.y < STONE_RADIUS) {
+      s.pos.y = STONE_RADIUS;
+      if (s.vel.y < -SETTLE_VEL) {
+        s.vel.y = -s.vel.y * s.restitution;
+        // friction on landing — kills lateral skid
+        s.vel.x *= 0.55;
+        s.vel.z *= 0.55;
+        // tumble a little on impact
+        s.rotX += s.vel.z * 0.3;
+        s.rotZ -= s.vel.x * 0.3;
+      } else {
+        s.vel.y = 0;
+        s.atRest = true;
+      }
+    } else {
+      s.atRest = false;
+    }
+
+    const dxh = s.homeX - s.pos.x;
+    const dzh = s.homeZ - s.pos.z;
+    s.vel.x += (LATERAL_K * dxh - LATERAL_DAMP * s.vel.x) * dt;
+    s.vel.z += (LATERAL_K * dzh - LATERAL_DAMP * s.vel.z) * dt;
+    s.pos.x += s.vel.x * dt;
+    s.pos.z += s.vel.z * dt;
   }
 
   // Write to InstancedMesh.
   let i = 0;
-  const t = clock.getElapsedTime();
-  const cursorPulse = 1.0 + 0.18 * Math.sin(t * 4.5);
+  const tNow = clock.getElapsedTime();
+  const cursorPulse = 1.0 + 0.16 * Math.sin(tNow * 4.5);
+
   for (const [k, s] of stoneState) {
     if (i >= MAX_STONES) break;
     const isCursor = k.startsWith("cursor:");
-    const scaleMul = isCursor ? cursorPulse : 1.0;
+    const pending = !s.dying && s.age < s.delay;
 
+    if (pending) {
+      // Render at zero scale (effectively invisible) until the
+      // spawn delay elapses; this keeps the slot live in the
+      // InstancedMesh but produces no on-screen blip.
+      dummy.position.set(0, -100, 0);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.setScalar(0.0001);
+      dummy.updateMatrix();
+      stones.setMatrixAt(i, dummy.matrix);
+      dummyColor.setRGB(0, 0, 0);
+      stones.setColorAt(i, dummyColor);
+      i++;
+      continue;
+    }
+
+    const scaleMul = isCursor ? cursorPulse : 1.0;
     dummy.position.copy(s.pos);
     dummy.rotation.set(s.rotX, s.rotY, s.rotZ);
     dummy.scale.setScalar(s.scale * scaleMul);
@@ -575,9 +606,40 @@ function step(dt) {
 }
 
 // ------------------------------------------------------------------
-// 8. Pointer hit testing — same routine as demo #01: raycast the
-//    page plane, get the UV, walk visualRows + measureText to recover
-//    a doc position. The stones themselves aren't hit-tested.
+// 9. Camera tracking. The camera glides over the page in XZ,
+//    keeping the caret near the centre. Clamped so the visible
+//    window stays inside the page bounds.
+// ------------------------------------------------------------------
+let camTargetX = 0;
+let camTargetZ = 0;
+
+function updateCamera() {
+  // Half the visible width/depth at the camera's height — used to
+  // clamp the tracking target so we never see past a page edge.
+  const halfFovV = (camera.fov * 0.5 * Math.PI) / 180;
+  const halfH = Math.tan(halfFovV) * CAMERA_HEIGHT;
+  const halfW = halfH * camera.aspect;
+
+  const margin = 0.1;
+  const maxX = PAGE_WIDTH * 0.5 - halfW + margin;
+  const minX = -maxX;
+  const maxZ = PAGE_DEPTH * 0.5 - halfH + margin;
+  const minZ = -maxZ;
+
+  let tx = Math.min(Math.max(cursorWorldX, minX), maxX);
+  let tz = Math.min(Math.max(cursorWorldZ, minZ), maxZ);
+  if (maxX < minX) tx = 0; // viewport bigger than page — just centre
+  if (maxZ < minZ) tz = 0;
+
+  camTargetX += (tx - camTargetX) * 0.10;
+  camTargetZ += (tz - camTargetZ) * 0.10;
+  camera.position.set(camTargetX, CAMERA_HEIGHT, camTargetZ);
+  camera.lookAt(camTargetX, 0, camTargetZ);
+}
+
+// ------------------------------------------------------------------
+// 10. Pointer hit testing — raycast the page plane, recover UV,
+//     walk visualRows + measureText to get a doc position.
 // ------------------------------------------------------------------
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
@@ -590,6 +652,10 @@ function docPosFromPointer(event) {
   if (!hits.length || !hits[0].uv) return null;
 
   const uv = hits[0].uv;
+  // PlaneGeometry default UVs: u=0 left, v=0 bottom. After we
+  // rotated the ground by -π/2 around X, vertex local-Y mapped to
+  // world -Z, so a world-space hit at z = -PAGE_DEPTH/2 hits the
+  // top of the original geometry → v=1. We invert to get canvas Y.
   const px = uv.x * TEX;
   const py = (1 - uv.y) * TEX;
 
@@ -654,9 +720,7 @@ stageEl.addEventListener("pointerup", endDrag);
 stageEl.addEventListener("pointercancel", endDrag);
 
 // ------------------------------------------------------------------
-// 9. Resize + animation loop. Physics + InstancedMesh writes happen
-//    every frame — they're cheap (no canvas readback now that the
-//    glyph cache pays the rasterisation cost once per character).
+// 11. Resize + animation loop.
 // ------------------------------------------------------------------
 function resize() {
   const w = window.innerWidth;
@@ -672,15 +736,19 @@ const clock = new THREE.Clock();
 function tick() {
   const dt = Math.min(clock.getDelta(), 1 / 30);
   step(dt);
+  updateCamera();
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
 
 document.fonts.load(`${FONT_SIZE}px "Bowlby One"`).then(() => {
-  // Pre-warm the cache for the initial doc so the first frame
-  // already has stones (and the spring snaps them in nicely).
   for (const ch of initialDoc) {
     if (ch !== " " && ch !== "\n" && ch !== "\t") getGlyph(ch);
   }
+  // Snap camera to its initial target so we don't pan from (0,0) on
+  // the first frame.
+  buildTargets();
+  camTargetX = cursorWorldX;
+  camTargetZ = cursorWorldZ;
   tick();
 });
