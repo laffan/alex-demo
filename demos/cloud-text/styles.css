@@ -1,0 +1,58 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #05060a;
+  color: #efe5cb;
+  font-family: "Archivo Black", "Inter", sans-serif;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  cursor: text;
+  outline: none;
+  z-index: 1;
+}
+
+/* Same trick as the undulating-surface demo: the hidden CodeMirror
+   instance lives in-viewport at full size, but z-index keeps it under
+   the WebGL canvas. Firefox refuses keystrokes to off-screen or
+   opacity:0 contenteditables, so we hide-by-cover rather than
+   hide-by-vanish. */
+#editor-host {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 1200px;
+  height: 1600px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+#hint {
+  position: fixed;
+  bottom: 18px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: #efe5cb;
+  opacity: 0.4;
+  pointer-events: none;
+  z-index: 2;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
