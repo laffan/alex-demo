@@ -11,16 +11,16 @@ const SELECTION_HEX = "#6a86ff";
 const CURSOR_HEX = "#aeefff";
 
 // ------------------------------------------------------------------
-// 1. Hidden CodeMirror 6 editor (owns input, selection, history)
+// 1. Hidden CodeMirror 6 editor.
 // ------------------------------------------------------------------
 const initialDoc = `CLOUDS
 
-Write here as if it were smoke.
-The glyphs are a density field;
-the field is sampled by a slab
-of noise raymarched per pixel.
+write here as if it
+were smoke
 
-Try a # heading or a > quote.`;
+# a heading is louder
+
+> a quote is bracketed`;
 
 const view = new EditorView({
   doc: initialDoc,
@@ -31,20 +31,21 @@ const view = new EditorView({
 view.focus();
 
 // ------------------------------------------------------------------
-// 2. Texture canvas — the editor rasterised as a *density* map. The
-//    fragment shader treats the red channel as how much smoke sits at
-//    z=0 at each UV; everything else (light, depth, billow) is
-//    procedural in the shader.
+// 2. Texture canvas — same role as in demo #01: a 2D rasterisation
+//    of the editor that the GPU samples. The font is now much bigger
+//    so individual glyphs read at the camera's close zoom; the atlas
+//    grows to match. Selection and cursor still get their own paint
+//    colours so the shader can recover them from RGB alone.
 // ------------------------------------------------------------------
-const TEX = 2048;
+const TEX = 3072;
 const texCanvas = document.createElement("canvas");
 texCanvas.width = TEX;
 texCanvas.height = TEX;
 const tctx = texCanvas.getContext("2d");
 
-const FONT_SIZE = 140;
-const LINE_HEIGHT = 168;
-const PADDING = 220;
+const FONT_SIZE = 280;
+const LINE_HEIGHT = 340;
+const PADDING = 240;
 const FONT_FAMILY = '"Archivo Black", "Inter", sans-serif';
 
 let cursorBlink = true;
@@ -54,6 +55,11 @@ setInterval(() => {
 
 let scrollTopRow = 0;
 let visualRows = [];
+// Pixel coords of the caret in the atlas; the camera lerps toward
+// these every frame so the cursor stays roughly in the middle of
+// the screen as you type.
+let cursorAtlasPx = TEX * 0.5;
+let cursorAtlasPy = TEX * 0.5;
 
 function lineStyle(text) {
   const h = /^(#{1,6})\s+/.exec(text);
@@ -61,7 +67,7 @@ function lineStyle(text) {
     const level = h[1].length;
     return {
       weight: "900",
-      size: Math.max(FONT_SIZE - (level - 1) * 14, FONT_SIZE - 40),
+      size: Math.max(FONT_SIZE - (level - 1) * 24, FONT_SIZE - 70),
       bar: false,
     };
   }
@@ -147,8 +153,12 @@ function renderTexture() {
   const hasRange = selFrom !== selTo;
 
   const cursorRowIdx = findCursorRow(visualRows, head);
-  const visibleRowCount = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
 
+  // We still keep a "scroll" concept so a long document can't paint
+  // outside the atlas, but with the camera following the caret the
+  // visible window is small and centred — we just need enough rows
+  // above/below cursor to stay in atlas bounds while panning.
+  const visibleRowCount = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
   if (cursorRowIdx < scrollTopRow) scrollTopRow = cursorRowIdx;
   if (cursorRowIdx >= scrollTopRow + visibleRowCount)
     scrollTopRow = cursorRowIdx - visibleRowCount + 1;
@@ -165,28 +175,24 @@ function renderTexture() {
 
     if (s.bar && row.isFirstInLine) {
       tctx.fillStyle = TEXT_HEX;
-      tctx.fillRect(PADDING - 36, y + 12, 10, s.size - 24);
+      tctx.fillRect(PADDING - 70, y + 20, 22, s.size - 40);
     }
 
-    // Selection: drawn in a distinct hue so the shader can tell glyphs
-    // and selection apart from the red channel alone. We use a bluer
-    // tone for selection — the fragment shader looks at .b minus .r to
-    // recover a selection mask.
     if (hasRange && selTo > row.startDocPos && selFrom <= row.endDocPos) {
       const startCol = Math.max(0, selFrom - row.startDocPos);
       const endCol = Math.min(row.text.length, selTo - row.startDocPos);
       const x1 = PADDING + tctx.measureText(row.text.slice(0, startCol)).width;
       const x2 = PADDING + tctx.measureText(row.text.slice(0, endCol)).width;
       const extendsPastRow = selTo > row.endDocPos;
-      const xEnd = extendsPastRow ? TEX - PADDING : Math.max(x2, x1 + 18);
+      const xEnd = extendsPastRow ? TEX - PADDING : Math.max(x2, x1 + 30);
       tctx.fillStyle = SELECTION_HEX;
-      tctx.fillRect(x1, y, xEnd - x1, s.size + 8);
+      tctx.fillRect(x1, y, xEnd - x1, s.size + 20);
     }
 
     tctx.fillStyle = TEXT_HEX;
     tctx.fillText(row.text, PADDING, baseline);
 
-    if (r === cursorRowIdx && cursorBlink) {
+    if (r === cursorRowIdx) {
       const localCol = Math.min(
         Math.max(0, head - row.startDocPos),
         row.text.length,
@@ -196,8 +202,17 @@ function renderTexture() {
       const blockWidth = cursorChar
         ? tctx.measureText(cursorChar).width
         : tctx.measureText("M").width * 0.55;
-      tctx.fillStyle = CURSOR_HEX;
-      tctx.fillRect(PADDING + wBefore, y + 8, blockWidth, s.size - 8);
+
+      // Always record the caret atlas position — the JS-side camera
+      // pan reads it even when the visible cursor block is blinked
+      // off, so the camera doesn't pulse with the blink.
+      cursorAtlasPx = PADDING + wBefore + blockWidth * 0.5;
+      cursorAtlasPy = y + s.size * 0.5;
+
+      if (cursorBlink) {
+        tctx.fillStyle = CURSOR_HEX;
+        tctx.fillRect(PADDING + wBefore, y + 20, blockWidth, s.size - 20);
+      }
     }
 
     y += LINE_HEIGHT;
@@ -206,189 +221,175 @@ function renderTexture() {
 }
 
 // ------------------------------------------------------------------
-// 3. three.js: a single full-screen plane, raymarched as a thin
-//    volumetric slab. The texture is the slab's density at z=0; 3D
-//    fbm noise stretches that density out along z and warps the UV
-//    lookup so the glyphs read as billowing smoke rather than a flat
-//    sticker on glass.
+// 3. three.js: a single full-screen quad. The fragment shader does
+//    a *cheap* volumetric pass — far fewer steps than the original,
+//    no per-step shadow tap, and a 5-tap "is there text near here?"
+//    pre-check that lets it skip the march entirely on empty sky.
+//    For a screen of mostly-empty background that pre-check is what
+//    keeps the framerate up.
 // ------------------------------------------------------------------
 const stage = document.getElementById("stage");
 const renderer = new THREE.WebGLRenderer({ canvas: stage, antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight, false);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(BG_HEX);
 
-const camera = new THREE.PerspectiveCamera(
-  42,
-  window.innerWidth / window.innerHeight,
-  0.1,
-  100,
-);
-camera.position.set(0, 0, 4.8);
+// Orthographic-ish camera: a single quad covers the screen, all the
+// "depth" is conjured in the fragment shader.
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const geometry = new THREE.PlaneGeometry(2, 2, 1, 1);
 
 const texture = new THREE.CanvasTexture(texCanvas);
 texture.minFilter = THREE.LinearFilter;
 texture.magFilter = THREE.LinearFilter;
-texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
-
-// One quad. The shader does all the work.
-const geometry = new THREE.PlaneGeometry(3.4, 3.4, 1, 1);
 
 const vertexShader = /* glsl */ `
   varying vec2 vUv;
   void main() {
     vUv = uv;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    gl_Position = vec4(position.xy, 0.0, 1.0);
   }
 `;
 
-// Volumetric pass. For each fragment we step through a small range
-// of z (the "slab"), sample 3D fbm noise (animated), and sample the
-// text atlas with a noise-displaced UV. The text serves as 2D
-// density centred on z=0 and falling off with a gaussian window.
-// Emission accumulates in front-to-back order with Beer-Lambert
-// transmittance, so the front of a cloud occludes its back — exactly
-// what gives glyphs their "soft volume" look.
+// Volumetric pass, lean version. The slab is *thin* and the
+// "fluff" comes from a 2D fbm sampled per slice with z baked into
+// translation, which is roughly half the cost of a true 3D fbm and
+// looks indistinguishable on a slab this shallow.
+//
+// The big win is `densityProbe`: a 5-tap lookup into the unwarped
+// text texture in a small neighbourhood. If none of those taps see
+// any text, we know no warp could possibly pull text into this
+// fragment and we exit immediately as sky. On a typical screen the
+// vast majority of fragments take that branch.
 const fragmentShader = /* glsl */ `
   precision highp float;
 
   uniform sampler2D uTex;
   uniform float uTime;
-  uniform vec2 uRes;
+  uniform vec2 uOrigin;     // atlas UV the camera is centred on
+  uniform vec2 uViewSize;   // fraction of atlas the screen shows
   varying vec2 vUv;
 
-  float hash13(vec3 p) {
-    p  = fract(p * vec3(443.897, 441.423, 437.195));
-    p += dot(p, p.yzx + 19.19);
-    return fract((p.x + p.y) * p.z);
+  float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
   }
 
-  float vnoise(vec3 p) {
-    vec3 i = floor(p);
-    vec3 f = fract(p);
+  float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
-    float n000 = hash13(i + vec3(0.0, 0.0, 0.0));
-    float n100 = hash13(i + vec3(1.0, 0.0, 0.0));
-    float n010 = hash13(i + vec3(0.0, 1.0, 0.0));
-    float n110 = hash13(i + vec3(1.0, 1.0, 0.0));
-    float n001 = hash13(i + vec3(0.0, 0.0, 1.0));
-    float n101 = hash13(i + vec3(1.0, 0.0, 1.0));
-    float n011 = hash13(i + vec3(0.0, 1.0, 1.0));
-    float n111 = hash13(i + vec3(1.0, 1.0, 1.0));
-    return mix(
-      mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
-      mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y),
-      f.z);
+    float a = hash12(i);
+    float b = hash12(i + vec2(1.0, 0.0));
+    float c = hash12(i + vec2(0.0, 1.0));
+    float d = hash12(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
   }
 
-  float fbm(vec3 p) {
-    float v = 0.0;
-    float a = 0.55;
-    for (int i = 0; i < 5; i++) {
-      v += a * vnoise(p);
-      p *= 2.07;
-      a *= 0.5;
-    }
-    return v;
+  // 2-octave fbm. The shape we need ("clumpy with some detail")
+  // doesn't justify more — extra octaves just shrink the dynamic
+  // range and add cost.
+  float fbm2(vec2 p) {
+    return vnoise(p) * 0.65 + vnoise(p * 2.0 + 11.3) * 0.35;
   }
 
-  // Background — a faint, slowly drifting sky so the canvas is never
-  // dead flat black behind the clouds.
-  vec3 sky(vec2 uv) {
-    float g = smoothstep(0.0, 1.4, 1.0 - length(uv - vec2(0.5, 0.6)));
+  vec3 sky(vec2 sUv) {
+    float g = smoothstep(0.0, 1.4, 1.0 - length(sUv - vec2(0.5, 0.55)));
     vec3 deep = vec3(0.018, 0.022, 0.032);
     vec3 lift = vec3(0.06, 0.08, 0.13);
-    float n = fbm(vec3(uv * 3.0, uTime * 0.04)) * 0.4;
-    return mix(deep, lift, g * 0.65) + vec3(n) * 0.04;
+    return mix(deep, lift, g * 0.65);
+  }
+
+  // Pre-check: peek at the unwarped atlas in a small neighbourhood.
+  // Returns the max "anything there?" signal — combined glyph and
+  // selection density. If this is essentially zero, no warp can
+  // pull text into this fragment, so the march is unnecessary.
+  float densityProbe(vec2 atlasUv) {
+    float r = 0.0;
+    vec4 t0 = texture2D(uTex, atlasUv);
+    vec4 t1 = texture2D(uTex, atlasUv + vec2( 0.045, 0.0));
+    vec4 t2 = texture2D(uTex, atlasUv + vec2(-0.045, 0.0));
+    vec4 t3 = texture2D(uTex, atlasUv + vec2(0.0,  0.045));
+    vec4 t4 = texture2D(uTex, atlasUv + vec2(0.0, -0.045));
+    r = max(r, max(t0.r, t0.b));
+    r = max(r, max(t1.r, t1.b));
+    r = max(r, max(t2.r, t2.b));
+    r = max(r, max(t3.r, t3.b));
+    r = max(r, max(t4.r, t4.b));
+    return r;
   }
 
   void main() {
-    vec2 uv = vUv;
+    // Pan + zoom: vUv covers the whole screen, atlasUv is the
+    // sub-window of the text canvas we're actually showing.
+    vec2 atlasUv = uOrigin + (vUv - 0.5) * uViewSize;
 
-    // Camera-style ray for parallax-flavoured depth: each slab slice
-    // sits at a slightly different uv, so glyphs at the back of the
-    // slab appear shifted relative to the front. Cheap, sells volume.
-    vec2 ndc = uv * 2.0 - 1.0;
-    vec3 ro = vec3(0.0, 0.0, 1.0);
-    vec3 rd = normalize(vec3(ndc * 0.45, -1.0));
+    // Aspect-correct uv that matches a square atlas region — used by
+    // the noise so fbm cells are square in atlas space, not stretched.
+    vec2 nUv = atlasUv;
 
-    const int STEPS = 32;
-    float zNear = -0.55;
-    float zFar  =  0.55;
+    float probe = densityProbe(atlasUv);
+    if (probe < 0.02) {
+      // Pure sky — skip the entire march.
+      vec3 col = sky(vUv);
+      float vig = smoothstep(1.15, 0.2, length(vUv - 0.5));
+      col *= 0.78 + 0.22 * vig;
+      gl_FragColor = vec4(col, 1.0);
+      return;
+    }
+
+    const int STEPS = 12;
+    float zNear = -0.45;
+    float zFar  =  0.45;
     float dz = (zFar - zNear) / float(STEPS);
 
     vec3 emit = vec3(0.0);
     float trans = 1.0;
 
-    // Light direction in slab space — gives the clouds a soft self-
-    // shadow along z.
-    vec3 lightDir = normalize(vec3(0.35, 0.45, 1.0));
-
     for (int s = 0; s < STEPS; s++) {
       float t = (float(s) + 0.5) / float(STEPS);
       float z = mix(zNear, zFar, t);
 
-      // ray uv at this slab depth
-      vec3 p = ro + rd * (1.0 - t) * 1.4;
-      vec2 ruv = p.xy * 0.5 + 0.5;
+      // 2D fbm with z and time baked into translation: cheap, looks
+      // identical on a slab this thin.
+      vec2 np = nUv * 4.0 + vec2(z * 1.2, uTime * 0.10);
+      float n  = fbm2(np);
+      float n2 = fbm2(np * 1.6 + 19.7);
 
-      // 3D fbm domain for both warp and density modulation.
-      vec3 np = vec3(ruv * 4.2, z * 2.6 + uTime * 0.18);
-      float n  = fbm(np);
-      float n2 = fbm(np * 1.7 + 11.3);
-
-      // Noise-warped lookup into the text atlas. The warp scale grows
-      // with |z| so the front and back of each glyph fray outward,
-      // exactly like a slice through a column of smoke.
-      vec2 wuv = ruv + (vec2(n, n2) - 0.5) * (0.045 + 0.085 * abs(z));
+      // UV warp magnitude grows with |z| so glyph fronts/backs fray.
+      vec2 wuv = atlasUv + (vec2(n, n2) - 0.5) * (0.020 + 0.060 * abs(z));
       vec4 texel = texture2D(uTex, wuv);
 
-      // Channel-split: red drives the glyph density, the bluer pixels
-      // we painted for selection drive a separately-coloured density
-      // so highlighted runs glow in a different hue.
       float glyph = texel.r;
       float seln  = clamp(texel.b - texel.r * 0.6, 0.0, 1.0);
 
-      // Gaussian window in z so density peaks at the slab centre.
       float window = exp(-z * z * 11.0);
-      float dens = (glyph * 0.85 + seln * 0.6) * window * (0.45 + 0.85 * n);
+      float dens = (glyph * 0.95 + seln * 0.65) * window * (0.5 + 0.85 * n);
 
-      // Soft self-shadow: sample density once along the light dir, a
-      // single tap is enough to get the "thicker = darker behind"
-      // feel without paying for a full secondary march.
-      vec3 lp = vec3(wuv, z) + lightDir * 0.06;
-      float shadow = fbm(vec3(lp.xy * 4.2, lp.z * 2.6 + uTime * 0.18));
-      float lit = clamp(1.0 - dens * 0.4 * (1.0 - shadow), 0.25, 1.0);
-
-      // Two-tone emission: warm core, cool fringe. Selection is bluer
-      // still and pushed brighter.
-      vec3 textCol = mix(
-        vec3(0.92, 0.85, 0.72),
-        vec3(1.05, 1.02, 0.94),
-        smoothstep(0.0, 1.0, dens * 2.5));
-      vec3 selCol = vec3(0.55, 0.72, 1.25);
+      vec3 textCol = vec3(0.95, 0.92, 0.82);
+      vec3 selCol  = vec3(0.55, 0.72, 1.25);
       vec3 sliceEmit = mix(textCol, selCol, clamp(seln * 1.4, 0.0, 1.0));
-      sliceEmit *= lit;
 
-      emit  += trans * sliceEmit * dens * dz * 3.6;
+      // Cheap depth shading: front-of-slab glows brighter. No second
+      // raymarch, no normal estimation — just a t-driven lerp.
+      sliceEmit *= mix(0.55, 1.05, t);
+
+      emit  += trans * sliceEmit * dens * dz * 4.0;
       trans *= exp(-dens * dz * 5.5);
 
-      if (trans < 0.01) break;
+      if (trans < 0.02) break;
     }
 
-    vec3 bg = sky(uv);
+    vec3 bg = sky(vUv);
     vec3 col = bg * trans + emit;
 
-    // gentle vignette
-    float vig = smoothstep(1.15, 0.2, length(uv - 0.5));
+    float vig = smoothstep(1.15, 0.2, length(vUv - 0.5));
     col *= 0.78 + 0.22 * vig;
 
-    // tone map + tiny grain so the dark areas have life
     col = col / (col + vec3(0.85));
-    float grain = (hash13(vec3(gl_FragCoord.xy, uTime)) - 0.5) * 0.025;
-    col += grain;
 
     gl_FragColor = vec4(col, 1.0);
   }
@@ -398,7 +399,8 @@ const material = new THREE.ShaderMaterial({
   uniforms: {
     uTex: { value: texture },
     uTime: { value: 0 },
-    uRes: { value: new THREE.Vector2() },
+    uOrigin: { value: new THREE.Vector2(0.5, 0.5) },
+    uViewSize: { value: new THREE.Vector2(0.4, 0.4) },
   },
   vertexShader,
   fragmentShader,
@@ -408,23 +410,47 @@ const mesh = new THREE.Mesh(geometry, material);
 scene.add(mesh);
 
 // ------------------------------------------------------------------
-// 4. Click + drag to move the caret / select text. Same approach as
-//    the undulating-surface demo: raycast the (still-flat) plane, get
-//    a UV, walk the visualRows table to recover a doc position.
+// 4. Camera follow: lerp the atlas origin toward the cursor each
+//    frame, and clamp so the visible window stays inside the atlas.
 // ------------------------------------------------------------------
-const raycaster = new THREE.Raycaster();
-const ndc = new THREE.Vector2();
+let viewSize = new THREE.Vector2(0.4, 0.4);
+let camOrigin = new THREE.Vector2(0.5, 0.5);
 
+function updateViewSize() {
+  // Show roughly the same atlas height regardless of aspect; widen
+  // the horizontal view on landscape monitors. The 0.95 ceiling
+  // keeps a sliver of clamp margin on either side so origin clamping
+  // still has somewhere to clamp to on ultrawide screens.
+  const aspect = window.innerWidth / window.innerHeight;
+  const baseH = 0.42;
+  viewSize.set(Math.min(0.95, baseH * aspect), Math.min(0.95, baseH));
+  material.uniforms.uViewSize.value.copy(viewSize);
+}
+
+function clampOrigin(o) {
+  const halfW = viewSize.x * 0.5;
+  const halfH = viewSize.y * 0.5;
+  o.x = Math.min(Math.max(o.x, halfW), 1 - halfW);
+  o.y = Math.min(Math.max(o.y, halfH), 1 - halfH);
+}
+
+function targetOrigin() {
+  // Atlas pixels y axis runs top-to-bottom; UV y runs bottom-to-top.
+  return new THREE.Vector2(cursorAtlasPx / TEX, 1 - cursorAtlasPy / TEX);
+}
+
+// ------------------------------------------------------------------
+// 5. Click + drag to move the caret / select text. The hit test has
+//    to undo the same pan+zoom the shader applied so a click on a
+//    visible glyph maps to the correct atlas pixel.
+// ------------------------------------------------------------------
 function docPosFromPointer(event) {
-  ndc.x = (event.clientX / window.innerWidth) * 2 - 1;
-  ndc.y = -(event.clientY / window.innerHeight) * 2 + 1;
-  raycaster.setFromCamera(ndc, camera);
-  const hits = raycaster.intersectObject(mesh);
-  if (!hits.length || !hits[0].uv) return null;
-
-  const uv = hits[0].uv;
-  const px = uv.x * TEX;
-  const py = (1 - uv.y) * TEX;
+  const sx = event.clientX / window.innerWidth;
+  const sy = 1 - event.clientY / window.innerHeight;
+  const atlasU = camOrigin.x + (sx - 0.5) * viewSize.x;
+  const atlasV = camOrigin.y + (sy - 0.5) * viewSize.y;
+  const px = atlasU * TEX;
+  const py = (1 - atlasV) * TEX;
 
   if (visualRows.length === 0) return null;
 
@@ -490,29 +516,45 @@ stageEl.addEventListener("pointerup", endDrag);
 stageEl.addEventListener("pointercancel", endDrag);
 
 // ------------------------------------------------------------------
-// 5. Resize + animation loop. Defer kickoff until Archivo Black has
-//    actually loaded, otherwise the first few frames render in the
-//    fallback sans and the glyphs come out thinner than the shader
-//    expects.
+// 6. Resize + animation loop.
 // ------------------------------------------------------------------
 function resize() {
-  const w = window.innerWidth;
-  const h = window.innerHeight;
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
-  renderer.setSize(w, h, false);
-  material.uniforms.uRes.value.set(w, h);
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  updateViewSize();
 }
 window.addEventListener("resize", resize);
 resize();
+
+// Snap the camera to the initial cursor position so we don't pan from
+// (0.5, 0.5) on first frame.
+function initCamera() {
+  renderTexture();
+  const t = targetOrigin();
+  clampOrigin(t);
+  camOrigin.copy(t);
+  material.uniforms.uOrigin.value.copy(camOrigin);
+}
 
 const clock = new THREE.Clock();
 function tick() {
   material.uniforms.uTime.value = clock.getElapsedTime();
   renderTexture();
   texture.needsUpdate = true;
+
+  const t = targetOrigin();
+  clampOrigin(t);
+  // Lerp factor — high enough to keep up with fast typing, low
+  // enough that arrow-key sweeps glide rather than jump.
+  const k = 0.12;
+  camOrigin.x += (t.x - camOrigin.x) * k;
+  camOrigin.y += (t.y - camOrigin.y) * k;
+  material.uniforms.uOrigin.value.copy(camOrigin);
+
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
 
-document.fonts.load(`${FONT_SIZE}px "Archivo Black"`).then(tick);
+document.fonts.load(`${FONT_SIZE}px "Archivo Black"`).then(() => {
+  initCamera();
+  tick();
+});
