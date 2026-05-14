@@ -393,9 +393,11 @@ function stepSim() {
 //    sim. The vertex shader samples the current sim RT, the fragment
 //    shader recovers a normal from screen-space derivatives.
 // ------------------------------------------------------------------
-const PLANE = 3.2;
+// A unit plane that we scale per-frame to overflow the viewport.
+// MESH_RES is the subdivision count — fixed independent of size so
+// the cloth detail stays consistent across monitor shapes.
 const MESH_RES = 320;
-const planeGeo = new THREE.PlaneGeometry(PLANE, PLANE, MESH_RES, MESH_RES);
+const planeGeo = new THREE.PlaneGeometry(1, 1, MESH_RES, MESH_RES);
 
 const vertexShader = /* glsl */ `
   uniform sampler2D uCloth;
@@ -486,6 +488,17 @@ const material = new THREE.ShaderMaterial({
 
 const mesh = new THREE.Mesh(planeGeo, material);
 scene.add(mesh);
+
+// Size the (unit) plane so it just fills the camera frustum at z=0.
+// A hair of margin (1.02×) prevents pixel-perfect aspect mismatches
+// from showing a one-pixel sliver of the page background at the
+// screen edges.
+function sizePlane() {
+  const vFov = (camera.fov * Math.PI) / 180;
+  const visH = 2 * camera.position.z * Math.tan(vFov / 2);
+  const visW = visH * camera.aspect;
+  mesh.scale.set(visW * 1.02, visH * 1.02, 1);
+}
 
 // ------------------------------------------------------------------
 // 6. Camera-follow (unchanged from previous version).
@@ -604,6 +617,7 @@ function resize() {
   camera.updateProjectionMatrix();
   renderer.setSize(w, h, false);
   updateViewSize();
+  sizePlane();
 }
 window.addEventListener("resize", resize);
 resize();
