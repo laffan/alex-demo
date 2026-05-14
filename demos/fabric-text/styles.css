@@ -1,0 +1,61 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  /* Off-white, matched to the fabric's flat colour so the rendered
+     plane melts into the page edges and the bumps are the only
+     visible information. */
+  background: #ecdcc6;
+  color: #2c2218;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  cursor: text;
+  outline: none;
+  z-index: 1;
+}
+
+/* Same hidden-CodeMirror trick as the rest of the series — see the
+   undulating-surface README for why z-index, not opacity, keeps
+   Firefox happy about routing key events here. */
+#editor-host {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 1200px;
+  height: 1600px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+#hint {
+  position: fixed;
+  bottom: 18px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: #2c2218;
+  opacity: 0.4;
+  pointer-events: none;
+  z-index: 2;
+  font-family: "Inter", ui-sans-serif, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  font-weight: 400;
+}
