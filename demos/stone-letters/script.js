@@ -4,16 +4,19 @@ import * as THREE from "https://esm.sh/three@0.160.0";
 import RAPIER from "https://esm.sh/@dimforge/rapier3d-compat@0.13.0";
 
 // ------------------------------------------------------------------
-// 0. Palette.
+// 0. Palette — pale grey ground, stones in a range of blues.
 // ------------------------------------------------------------------
-const SKY_HEX = "#cdb98a";
-const HORIZON_HEX = "#9d8758";
-const GROUND_HEX = "#bda175";
-const GROUND_DEEP_HEX = "#7e6c4a";
+const SKY_HEX = "#eeeeee";
+const HORIZON_HEX = "#c8c8c8";
+const GROUND_HEX = "#e8e8e8";
+const GROUND_DEEP_HEX = "#b8b8b8";
 
-const ROCK_BASE_HEX = "#3d2f20";
-const ROCK_HI_HEX = "#a08260";
-const ROCK_SELECT_HEX = "#c44a1f";
+// Two anchor blues; per-stone tint randomly slides between them so
+// the pile reads as many shades of one colour family rather than a
+// single uniform blue.
+const ROCK_BASE_HEX = "#1c3354";
+const ROCK_HI_HEX = "#8db8e6";
+const ROCK_SELECT_HEX = "#d68a2c";
 
 // Wait for the Rapier WASM blob to decode before doing anything else.
 // The compat build embeds the WASM as base64 so we don't need a
@@ -38,13 +41,28 @@ delete to fill in.`;
 let docDirty = true;
 let selectionDirty = true;
 
+// Typing-activity meter. Each doc change adds a pulse; the meter
+// decays exponentially each frame. We use it to drive the rock spawn
+// rate so the rain accelerates while you're typing and slows back
+// to a trickle when you stop.
+let typingActivity = 0;
+
 const view = new EditorView({
   doc: initialDoc,
   extensions: [
     basicSetup,
     markdown(),
     EditorView.updateListener.of((u) => {
-      if (u.docChanged) docDirty = true;
+      if (u.docChanged) {
+        docDirty = true;
+        // Sum up the size of inserted+deleted text so paste / large
+        // edits register as a bigger burst than a single keypress.
+        let chars = 0;
+        u.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+          chars += inserted.length + (toA - fromA);
+        });
+        typingActivity = Math.min(typingActivity + Math.max(1, chars), 30);
+      }
       if (u.selectionSet) selectionDirty = true;
     }),
   ],
@@ -221,8 +239,9 @@ const PAGE_SIZE = 7.0;
 const INDENT_DEPTH = 0.30;
 
 // Camera: looking down at an angle so we can see both the rock pile
-// and the surface they're forming.
-const CAMERA_DIST = 6.0;
+// and the surface they're forming. CAMERA_DIST pulled back so more
+// of the page fits in the frame at once.
+const CAMERA_DIST = 8.5;
 const CAMERA_TILT = 0.40; // radians forward of straight-down
 const camera = new THREE.PerspectiveCamera(
   42,
@@ -720,8 +739,10 @@ resize();
 //   - Step Rapier and copy each rock's pose into the InstancedMesh.
 //   - Despawn rocks that fell off the page.
 // ------------------------------------------------------------------
-let lastSpawn = 0;
-const SPAWN_INTERVAL = 0.012; // seconds between spawns (~80/sec)
+// Spawn rate is driven by typingActivity. Idle baseline is a slow
+// drizzle; the rate ramps up to a downpour when text is flowing in.
+const SPAWN_INTERVAL_IDLE = 0.20;  // ~5 rocks/sec when nobody is typing
+const SPAWN_INTERVAL_BUSY = 0.010; // ~100 rocks/sec at peak typing
 let spawnAcc = 0;
 
 function isInSelection(rb) {
@@ -747,10 +768,19 @@ function tick(now) {
   }
 
   const dt = 1 / 60;
+
+  // Decay the typing meter. Half-life of roughly one second so a
+  // burst of typing keeps the rain heavy for a few seconds afterwards.
+  typingActivity *= Math.exp(-dt * 0.7);
+  const busyness = Math.min(1, typingActivity / 12);
+  const spawnInterval =
+    SPAWN_INTERVAL_IDLE +
+    (SPAWN_INTERVAL_BUSY - SPAWN_INTERVAL_IDLE) * busyness;
+
   spawnAcc += dt;
-  while (spawnAcc >= SPAWN_INTERVAL) {
+  while (spawnAcc >= spawnInterval) {
     spawnRock();
-    spawnAcc -= SPAWN_INTERVAL;
+    spawnAcc -= spawnInterval;
   }
 
   world.step();
@@ -783,7 +813,10 @@ function tick(now) {
     if (isInSelection(rb)) {
       dummyColor.copy(selRock);
     } else {
-      dummyColor.copy(baseRock).lerp(hiRock, tone * 0.7);
+      // Full lerp between the two anchor blues so the pile actually
+      // shows a visible spread of shades rather than crowding near
+      // the dark end.
+      dummyColor.copy(baseRock).lerp(hiRock, tone);
     }
     rocks.setColorAt(writeIdx, dummyColor);
     writeIdx++;

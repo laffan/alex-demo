@@ -317,6 +317,43 @@ const fragmentShader = /* glsl */ `
     return v;
   }
 
+  // 13-tap gaussian-ish atlas sample. The raw text rasterisation has
+  // hard glyph edges, which read as sharp wafer-thin layers when
+  // ray-marched. Pre-blurring the atlas at the sample site turns
+  // those edges into soft penumbras — the cloud now drifts off into
+  // haze at its boundaries rather than ending in a crisp silhouette.
+  float sampleText(vec2 uv) {
+    float e = 0.0055;
+    float t = 0.0;
+    t += texture2D(uTex, uv).r * 0.20;
+    t += texture2D(uTex, uv + vec2( e, 0.0)).r * 0.12;
+    t += texture2D(uTex, uv + vec2(-e, 0.0)).r * 0.12;
+    t += texture2D(uTex, uv + vec2(0.0,  e)).r * 0.12;
+    t += texture2D(uTex, uv + vec2(0.0, -e)).r * 0.12;
+    t += texture2D(uTex, uv + vec2( e,  e)).r * 0.05;
+    t += texture2D(uTex, uv + vec2(-e,  e)).r * 0.05;
+    t += texture2D(uTex, uv + vec2( e, -e)).r * 0.05;
+    t += texture2D(uTex, uv + vec2(-e, -e)).r * 0.05;
+    // Wider ring for an even softer falloff.
+    float e2 = e * 2.2;
+    t += texture2D(uTex, uv + vec2( e2, 0.0)).r * 0.03;
+    t += texture2D(uTex, uv + vec2(-e2, 0.0)).r * 0.03;
+    t += texture2D(uTex, uv + vec2(0.0,  e2)).r * 0.03;
+    t += texture2D(uTex, uv + vec2(0.0, -e2)).r * 0.03;
+    return t;
+  }
+
+  float sampleSelect(vec2 uv) {
+    float e = 0.0055;
+    float t = 0.0;
+    t += texture2D(uTex, uv).b * 0.4;
+    t += texture2D(uTex, uv + vec2( e, 0.0)).b * 0.15;
+    t += texture2D(uTex, uv + vec2(-e, 0.0)).b * 0.15;
+    t += texture2D(uTex, uv + vec2(0.0,  e)).b * 0.15;
+    t += texture2D(uTex, uv + vec2(0.0, -e)).b * 0.15;
+    return t;
+  }
+
   // Sample volume density at world-space point p.
   // - Map p.xy to atlas uv via the camera-pan transform.
   // - Smooth bell-curve along z so density tapers at front/back.
@@ -327,21 +364,22 @@ const fragmentShader = /* glsl */ `
     if (atlasUv.x < 0.0 || atlasUv.x > 1.0 || atlasUv.y < 0.0 || atlasUv.y > 1.0) {
       return 0.0;
     }
-    vec4 tex = texture2D(uTex, atlasUv);
-    float text = max(tex.r, tex.b * 0.65);
-    if (text < 0.02) return 0.0;
+    float text = max(sampleText(atlasUv), sampleSelect(atlasUv) * 0.65);
+    if (text < 0.01) return 0.0;
 
     float zNorm = (p.z - uBoxMin.z) / (uBoxMax.z - uBoxMin.z); // 0..1
     float zc = zNorm * 2.0 - 1.0; // -1..1
-    float profile = exp(-zc * zc * 2.5);
+    // Wider bell — bleeds density further along z so each slice
+    // overlaps the next instead of stacking as a thin layer cake.
+    float profile = exp(-zc * zc * 1.6);
 
-    vec3 np = p * 2.2 + vec3(uTime * 0.05, uTime * 0.03, uTime * 0.12);
+    vec3 np = p * 1.8 + vec3(uTime * 0.05, uTime * 0.03, uTime * 0.12);
     float n = fbm3(np);
 
     // The noise modulates around 1, so density never drops to 0 inside
     // the glyph — the text always reads as a coherent shape, but with
     // puffy texture instead of a sharp ridge.
-    float puff = 0.45 + 0.95 * n;
+    float puff = 0.55 + 0.75 * n;
     return text * profile * puff;
   }
 
@@ -402,11 +440,14 @@ const fragmentShader = /* glsl */ `
       vec3 p = ro + rd * t;
       float d = density(p);
 
-      if (d > 0.01) {
+      if (d > 0.005) {
         float lt = lightMarch(p);
         vec3 emit = (lightCol * lt + ambient) * d;
         col += trans * emit * dt;
-        trans *= exp(-d * dt * 6.0);
+        // Lower extinction coefficient than before so density
+        // accumulates more gradually — soft haze instead of crisp
+        // wafer-thin slabs.
+        trans *= exp(-d * dt * 3.8);
         if (trans < 0.02) break;
       }
       t += dt;

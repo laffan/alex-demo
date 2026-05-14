@@ -9,9 +9,9 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #e8e8e8;
-  color: #1b2230;
-  font-family: "Bowlby One", "Inter", sans-serif;
+  background: #08090d;
+  color: #e9d9b6;
+  font-family: "Cormorant Garamond", Georgia, serif;
 }
 
 #stage {
@@ -25,9 +25,10 @@ body {
   z-index: 1;
 }
 
-/* The hidden CodeMirror trick again — see the undulating-surface
-   demo's README for why z-index, not opacity, is what keeps Firefox
-   willing to route keystrokes here. */
+/* Same hidden-CodeMirror trick as the rest of the series — a real
+   contenteditable kept in-viewport at full size, covered by the WebGL
+   canvas via z-index. Firefox routes keystrokes to it; the user only
+   sees the rendered scene. */
 #editor-host {
   position: fixed;
   top: 0;
@@ -47,8 +48,8 @@ body {
   font-size: 11px;
   letter-spacing: 0.25em;
   text-transform: uppercase;
-  color: #1b2230;
-  opacity: 0.5;
+  color: #e9d9b6;
+  opacity: 0.45;
   pointer-events: none;
   z-index: 2;
   font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",

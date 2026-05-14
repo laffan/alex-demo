@@ -338,9 +338,14 @@ const simFS = /* glsl */ `
     // below its rest position.
     float push = max(target - h, 0.0);
 
-    float K_TENSION = 220.0;
-    float K_PUSH    = 280.0;
-    float DAMP      = 4.0;
+    // Firmer cloth: a lower tension coefficient (slower wave propagation
+    // away from the push) plus much heavier damping (faster decay of
+    // overshoot) means a freshly added letter rises in place rather
+    // than radiating a visible ripple outwards. Push force is reduced
+    // a touch too so the lift is graceful instead of springy.
+    float K_TENSION = 90.0;
+    float K_PUSH    = 180.0;
+    float DAMP      = 10.0;
     float REST_PULL = 0.5;  // tiny pull toward zero when no push
     float restForce = (target < h) ? -REST_PULL * (h - target) : 0.0;
 
@@ -508,8 +513,11 @@ const camOrigin = new THREE.Vector2(0.5, 0.5);
 
 function updateViewSize() {
   const aspect = window.innerWidth / window.innerHeight;
-  const baseH = 0.78;
-  viewSize.set(Math.min(0.96, baseH * aspect), Math.min(0.96, baseH));
+  // Pulled back: a larger atlas window means we see more text and
+  // surrounding cloth per screen, which reads as a more zoomed-out
+  // camera.
+  const baseH = 0.96;
+  viewSize.set(Math.min(0.98, baseH * aspect), Math.min(0.98, baseH));
   material.uniforms.uViewSize.value.copy(viewSize);
 }
 
@@ -626,7 +634,8 @@ function initCamera() {
   renderTexture();
   const t = targetOrigin();
   clampOrigin(t);
-  camOrigin.copy(t);
+  camOrigin.x = 0.5;
+  camOrigin.y = t.y;
   material.uniforms.uOrigin.value.copy(camOrigin);
 }
 
@@ -640,7 +649,10 @@ function tick() {
   const t = targetOrigin();
   clampOrigin(t);
   const k = 0.10;
-  camOrigin.x += (t.x - camOrigin.x) * k;
+  // Vertical-only follow: the camera glides up and down with the
+  // caret but stays horizontally centred so lines never appear to
+  // slide sideways as you type.
+  camOrigin.x = 0.5;
   camOrigin.y += (t.y - camOrigin.y) * k;
   material.uniforms.uOrigin.value.copy(camOrigin);
 
