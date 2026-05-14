@@ -110,31 +110,38 @@ For each fragment, the shader does:
 
 1. **Pan + zoom** the screen UV into the atlas.
 2. **Pre-check** with `densityProbe(atlasUv)`: a 5-tap lookup at
-   the centre and four ±0.045 offsets. The max of all `r` and `b`
-   channels is taken as a "is anything text-like nearby?" signal.
-   If it's below ~0.02, the fragment is pure sky — output the
-   gradient and exit. This is the optimisation that makes the demo
-   actually playable.
-3. If the pre-check passes, **march 12 steps** through a thin slab
-   in z. At each step:
-   - Sample 2D fbm (2 octaves) with z and time baked into
-     translation. Cheap.
-   - UV-warp the atlas lookup by the noise vector, scaled by
-     `(0.020 + 0.060 * |z|)` so glyph fronts/backs fray.
-   - Compute density from glyph mask × Gaussian z-window × noise
-     modulation.
-   - Pick a slice colour (warm cream for text, cool blue for
-     selection); apply a cheap depth-driven brightness lerp instead
-     of a real shadow tap.
-4. **Composite** with Beer-Lambert transmittance, with an early-
+   the centre and four ±0.060 offsets. The max across all `r` and
+   `b` channels is taken as a "is anything text-like nearby?"
+   signal. If it's below ~0.03, the fragment is pure sky — output
+   the gradient and exit. This is the optimisation that makes the
+   demo actually playable.
+3. If the pre-check passes, also **sample the unwarped atlas at the
+   fragment's atlasUv** to anchor the density. Without this anchor,
+   pixels inside letter counter-forms (the holes in `o`, `e`, `B`)
+   pass the probe — the probe radius is wider than a glyph stem —
+   but every warped sample inside the loop lands off the glyph and
+   accumulates zero emission. They render as black cutouts framed
+   by bright letterform. The anchor fixes that by taking
+   `glyph = max(glyphCenter, glyphWarp)` per step: the warp can
+   puff density outward but can never dim what's already on the
+   glyph.
+4. **March 8 steps** through a thin slab in z, with a per-pixel
+   *spatial* hash offsetting the march phase. Eight straight steps
+   read as eight stacked posters; eight jittered steps read as soft
+   smoke because adjacent pixels sample at slightly shifted z.
+5. At each step: sample 2D fbm (2 octaves), warp the atlas lookup,
+   compute density from `(glyph * 1.0 + seln * 0.7) × window ×
+   (0.80 + 0.30 · n)`. The `0.80` floor on the noise multiplier
+   means even in noise-dark areas density stays at 80% of the
+   glyph value — letters can't strobe through to sky-black.
+6. **Composite** with Beer-Lambert transmittance, with an early-
    out when `trans < 0.02`.
-5. **Tone-map** with `col / (col + 0.85)` so the bright cores roll
+7. **Tone-map** with `col / (col + 0.85)` so the bright cores roll
    off into highlights.
 
 No 3D noise, no secondary rays, no normal estimation. The
 "volumetric" feel comes from accumulating warped 2D samples along
-a thin slab with proper transmittance, which is enough at this
-scale.
+a thin slab with proper transmittance.
 
 ---
 

@@ -339,16 +339,28 @@ const fragmentShader = /* glsl */ `
       return;
     }
 
+    // Sample the *unwarped* atlas at this fragment too. The march
+    // below also samples warped UVs; we anchor against the unwarped
+    // value so the warp can only ADD density, never gnaw the glyph
+    // dark from inside. Without this anchor, the holes in 'o', 'e',
+    // 'B' read as black cutouts: their fragments pass the probe
+    // (because the probe radius is wider than glyph stems), but
+    // inside the march the warp consistently lands off the glyph
+    // and accumulates zero emission, leaving the counter-form
+    // looking darker than its surrounding letterform.
+    vec4 centerTexel = texture2D(uTex, atlasUv);
+    float glyphCenter = centerTexel.r;
+    float selnCenter = clamp(centerTexel.b - centerTexel.r * 0.6, 0.0, 1.0);
+
     const int STEPS = 8;
     float zNear = -0.50;
     float zFar  =  0.50;
     float dz = (zFar - zNear) / float(STEPS);
 
-    // Per-pixel jitter on the march phase. This is the line that
-    // does the heavy lifting against banding: with it, an 8-step
-    // march reads as soft volume; without it, it reads as 8 layered
-    // posters.
-    float jitter = hash12(gl_FragCoord.xy + uTime * 60.0);
+    // Spatial-only jitter on the march phase — temporal jitter looks
+    // like film grain but it strobes without TAA, so we only spread
+    // the steps across neighbouring pixels.
+    float jitter = hash12(gl_FragCoord.xy);
 
     vec3 emit = vec3(0.0);
     float trans = 1.0;
@@ -357,25 +369,24 @@ const fragmentShader = /* glsl */ `
       float t = (float(s) + jitter) / float(STEPS);
       float z = mix(zNear, zFar, t);
 
-      // Lower-frequency noise than before: clouds clump softer.
       vec2 np = atlasUv * 3.0 + vec2(z * 1.4, uTime * 0.08);
       float n  = fbm2(np);
       float n2 = fbm2(np * 1.7 + 19.7);
 
-      // UV warp magnitude grows with |z|. The base value is small
-      // so unwarped text still anchors the eye; the |z| term frays
-      // the front and back.
-      vec2 wuv = atlasUv + (vec2(n, n2) - 0.5) * (0.018 + 0.075 * abs(z));
+      vec2 wuv = atlasUv + (vec2(n, n2) - 0.5) * (0.018 + 0.070 * abs(z));
       vec4 texel = texture2D(uTex, wuv);
 
-      float glyph = texel.r;
-      float seln  = clamp(texel.b - texel.r * 0.6, 0.0, 1.0);
+      // max() with the center sample means the warp can puff density
+      // outward but can't dim what's already on the glyph.
+      float glyph = max(glyphCenter, texel.r);
+      float seln  = max(selnCenter, clamp(texel.b - texel.r * 0.6, 0.0, 1.0));
 
-      // Softer z window — extends the cloud further along z than
-      // before, so glyphs read as "haze around a shape" instead of
-      // "thin sheet of paint".
       float window = exp(-z * z * 7.0);
-      float dens = (glyph * 1.05 + seln * 0.75) * window * (0.45 + 0.95 * n);
+      // Noise floor raised from 0.45 to 0.80 so the multiplicative
+      // noise can no longer take density below 80% of its glyph
+      // value. The 0.30 swing still gives clouds visible texture
+      // without ever flickering through to the sky.
+      float dens = (glyph * 1.0 + seln * 0.7) * window * (0.80 + 0.30 * n);
 
       vec3 textCol = vec3(0.95, 0.92, 0.82);
       vec3 selCol  = vec3(0.55, 0.72, 1.25);
@@ -423,12 +434,13 @@ let camOrigin = new THREE.Vector2(0.5, 0.5);
 
 function updateViewSize() {
   // Show roughly the same atlas height regardless of aspect; widen
-  // the horizontal view on landscape monitors. The 0.95 ceiling
-  // keeps a sliver of clamp margin on either side so origin clamping
-  // still has somewhere to clamp to on ultrawide screens.
+  // the horizontal view on landscape monitors. baseH=0.78 means the
+  // screen height covers ~78% of the atlas — most of the page is
+  // visible at all times, the camera just glides a little to follow
+  // the caret near the edges.
   const aspect = window.innerWidth / window.innerHeight;
-  const baseH = 0.42;
-  viewSize.set(Math.min(0.95, baseH * aspect), Math.min(0.95, baseH));
+  const baseH = 0.78;
+  viewSize.set(Math.min(0.96, baseH * aspect), Math.min(0.96, baseH));
   material.uniforms.uViewSize.value.copy(viewSize);
 }
 
