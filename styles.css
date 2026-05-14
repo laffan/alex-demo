@@ -6,104 +6,72 @@
 
 html,
 body {
-  min-height: 100%;
-  background: #16140f;
-  color: #efe5cb;
-  font-family: "Inter", ui-sans-serif, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", sans-serif;
+  height: 100%;
+  background: #f6f1e6;
+  color: #1a160f;
+  font-family: "Fraunces", Georgia, serif;
   -webkit-font-smoothing: antialiased;
 }
 
+body {
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
 main {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 96px 32px 64px;
+  width: 100%;
+  max-width: 420px;
+  text-align: center;
 }
 
-header h1 {
-  font-family: "Fraunces", Georgia, serif;
-  font-weight: 700;
-  font-size: clamp(36px, 6vw, 56px);
-  letter-spacing: -0.02em;
-  line-height: 1.05;
-  margin-bottom: 18px;
+h1 {
+  font-weight: 400;
+  font-size: clamp(28px, 5vw, 36px);
+  letter-spacing: -0.01em;
+  margin-bottom: 14px;
 }
 
-header p {
-  font-size: 16px;
-  line-height: 1.55;
-  color: rgba(239, 229, 203, 0.7);
-  max-width: 56ch;
+.lede {
+  font-size: 14px;
+  color: rgba(26, 22, 15, 0.55);
   margin-bottom: 64px;
+  letter-spacing: 0;
 }
 
 ol.demos {
   list-style: none;
   display: grid;
-  gap: 14px;
-  margin-bottom: 64px;
+  gap: 4px;
 }
 
 ol.demos a {
   display: grid;
-  grid-template-columns: 56px 1fr;
-  gap: 24px;
+  grid-template-columns: 36px 1fr;
+  gap: 18px;
   align-items: baseline;
-  padding: 24px 28px;
-  border: 1px solid rgba(239, 229, 203, 0.12);
-  border-radius: 4px;
+  padding: 14px 8px;
   text-decoration: none;
   color: inherit;
-  background: rgba(239, 229, 203, 0.02);
-  transition:
-    background 160ms ease,
-    border-color 160ms ease,
-    transform 160ms ease;
+  border-bottom: 1px solid transparent;
+  transition: border-color 160ms ease, color 160ms ease;
 }
 
 ol.demos a:hover,
 ol.demos a:focus-visible {
-  background: rgba(239, 229, 203, 0.06);
-  border-color: rgba(239, 229, 203, 0.28);
   outline: none;
-  transform: translateY(-1px);
+  border-bottom-color: rgba(26, 22, 15, 0.5);
 }
 
 ol.demos .num {
-  font-family: "Fraunces", Georgia, serif;
-  font-size: 28px;
-  font-weight: 400;
-  color: rgba(239, 229, 203, 0.45);
-  letter-spacing: 0;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: rgba(26, 22, 15, 0.4);
+  text-align: left;
 }
 
-ol.demos h2 {
-  font-family: "Fraunces", Georgia, serif;
-  font-weight: 700;
-  font-size: 22px;
-  letter-spacing: -0.01em;
-  margin-bottom: 6px;
-}
-
-ol.demos p {
-  font-size: 14.5px;
-  line-height: 1.55;
-  color: rgba(239, 229, 203, 0.65);
-  max-width: 54ch;
-}
-
-footer p {
-  font-size: 13px;
-  line-height: 1.6;
-  color: rgba(239, 229, 203, 0.45);
-  max-width: 60ch;
-}
-
-footer code {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 12px;
-  padding: 1px 5px;
-  background: rgba(239, 229, 203, 0.07);
-  border-radius: 3px;
-  color: rgba(239, 229, 203, 0.75);
+ol.demos .title {
+  font-size: 17px;
+  text-align: left;
 }
