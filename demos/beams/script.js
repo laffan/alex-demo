@@ -10,14 +10,7 @@ const BG_HEX = "#08090d";
 // ------------------------------------------------------------------
 // 1. Hidden CodeMirror editor.
 // ------------------------------------------------------------------
-const initialDoc = `LET THERE
-BE LIGHT
-
-every letter is a
-keyhole that the sun
-leans through.
-
-type to open more.`;
+const initialDoc = `In the beginning God created the heavens and the earth.`;
 
 const view = new EditorView({
   doc: initialDoc,
@@ -436,10 +429,12 @@ const camOrigin = new THREE.Vector2(0.5, 0.5);
 
 function updateViewSize() {
   const aspect = window.innerWidth / window.innerHeight;
-  // A wider window than the body text — we want to see the page
-  // floating in the dark, not crop into it.
+  // Aspect-preserving: viewSize.x / viewSize.y must equal the screen
+  // aspect or square atlas pixels render as non-square pixels on
+  // screen, squashing the text. Past the atlas edge the texture is
+  // clamp-to-edge black, which is what the dark scene wants anyway.
   const baseH = 0.95;
-  viewSize.set(Math.min(0.98, baseH * aspect), Math.min(0.98, baseH));
+  viewSize.set(baseH * aspect, baseH);
   material.uniforms.uViewSize.value.copy(viewSize);
 }
 

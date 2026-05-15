@@ -9,11 +9,11 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  /* Off-white, matched to the fabric's flat colour so the rendered
-     plane melts into the page edges and the bumps are the only
-     visible information. */
-  background: #ecdcc6;
-  color: #2c2218;
+  /* Near-white to match the printed fabric background; the rendered
+     plane melts into the page edges so the bumps and the pattern do
+     all the visual work. */
+  background: #fefcf7;
+  color: #1a2a3d;
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
 }
@@ -51,8 +51,8 @@ body {
   font-size: 11px;
   letter-spacing: 0.25em;
   text-transform: uppercase;
-  color: #2c2218;
-  opacity: 0.4;
+  color: #1a2a3d;
+  opacity: 0.45;
   pointer-events: none;
   z-index: 2;
   font-family: "Inter", ui-sans-serif, -apple-system, BlinkMacSystemFont,

@@ -10,14 +10,7 @@ const BG_HEX = "#05060a";
 // ------------------------------------------------------------------
 // 1. Hidden CodeMirror editor.
 // ------------------------------------------------------------------
-const initialDoc = `CLOUDS
-
-write here as if it
-were smoke
-
-# a heading is louder
-
-> a quote is bracketed`;
+const initialDoc = `A salesman who shared his liquor and steered while sleeping`;
 
 const view = new EditorView({
   doc: initialDoc,
@@ -317,69 +310,50 @@ const fragmentShader = /* glsl */ `
     return v;
   }
 
-  // 13-tap gaussian-ish atlas sample. The raw text rasterisation has
-  // hard glyph edges, which read as sharp wafer-thin layers when
-  // ray-marched. Pre-blurring the atlas at the sample site turns
-  // those edges into soft penumbras — the cloud now drifts off into
-  // haze at its boundaries rather than ending in a crisp silhouette.
-  float sampleText(vec2 uv) {
-    float e = 0.0055;
-    float t = 0.0;
-    t += texture2D(uTex, uv).r * 0.20;
-    t += texture2D(uTex, uv + vec2( e, 0.0)).r * 0.12;
-    t += texture2D(uTex, uv + vec2(-e, 0.0)).r * 0.12;
-    t += texture2D(uTex, uv + vec2(0.0,  e)).r * 0.12;
-    t += texture2D(uTex, uv + vec2(0.0, -e)).r * 0.12;
-    t += texture2D(uTex, uv + vec2( e,  e)).r * 0.05;
-    t += texture2D(uTex, uv + vec2(-e,  e)).r * 0.05;
-    t += texture2D(uTex, uv + vec2( e, -e)).r * 0.05;
-    t += texture2D(uTex, uv + vec2(-e, -e)).r * 0.05;
-    // Wider ring for an even softer falloff.
-    float e2 = e * 2.2;
-    t += texture2D(uTex, uv + vec2( e2, 0.0)).r * 0.03;
-    t += texture2D(uTex, uv + vec2(-e2, 0.0)).r * 0.03;
-    t += texture2D(uTex, uv + vec2(0.0,  e2)).r * 0.03;
-    t += texture2D(uTex, uv + vec2(0.0, -e2)).r * 0.03;
-    return t;
-  }
-
-  float sampleSelect(vec2 uv) {
-    float e = 0.0055;
-    float t = 0.0;
-    t += texture2D(uTex, uv).b * 0.4;
-    t += texture2D(uTex, uv + vec2( e, 0.0)).b * 0.15;
-    t += texture2D(uTex, uv + vec2(-e, 0.0)).b * 0.15;
-    t += texture2D(uTex, uv + vec2(0.0,  e)).b * 0.15;
-    t += texture2D(uTex, uv + vec2(0.0, -e)).b * 0.15;
-    return t;
+  // Heat-shimmer warp. The atlas uv that drives volume density gets
+  // displaced by an animated noise field whose amplitude grows toward
+  // the back of the slab, so the rear of the cloud ripples more than
+  // the front — the same trick that makes asphalt over a hot road
+  // look watery, only painted into a volumetric text atlas.
+  vec2 wobble(vec2 uv, float zNorm) {
+    float t = uTime;
+    // Two octaves of cosine ripple, axis-decorrelated so the
+    // distortion isn't a simple swirl. The 1.4× amplification
+    // toward the back of the slab is what gives the back layers
+    // their visible boil.
+    float amp = 0.0042 * (0.55 + 1.0 * zNorm);
+    float fx = cos(uv.y * 38.0 + t * 1.7) + 0.55 * cos(uv.y * 71.0 - t * 2.3);
+    float fy = sin(uv.x * 33.0 - t * 1.4) + 0.55 * sin(uv.x * 67.0 + t * 1.9);
+    return uv + vec2(fx, fy) * amp;
   }
 
   // Sample volume density at world-space point p.
   // - Map p.xy to atlas uv via the camera-pan transform.
+  // - Wobble that uv with the heat-shimmer field.
   // - Smooth bell-curve along z so density tapers at front/back.
   // - 3D fbm puffiness, animated by uTime.
   float density(vec3 p) {
     vec2 boxUv = (p.xy - uBoxMin.xy) / (uBoxMax.xy - uBoxMin.xy);
     vec2 atlasUv = uOrigin + (boxUv - 0.5) * uViewSize;
+    float zNorm = (p.z - uBoxMin.z) / (uBoxMax.z - uBoxMin.z); // 0..1
+    atlasUv = wobble(atlasUv, zNorm);
     if (atlasUv.x < 0.0 || atlasUv.x > 1.0 || atlasUv.y < 0.0 || atlasUv.y > 1.0) {
       return 0.0;
     }
-    float text = max(sampleText(atlasUv), sampleSelect(atlasUv) * 0.65);
-    if (text < 0.01) return 0.0;
+    vec4 tex = texture2D(uTex, atlasUv);
+    float text = max(tex.r, tex.b * 0.65);
+    if (text < 0.02) return 0.0;
 
-    float zNorm = (p.z - uBoxMin.z) / (uBoxMax.z - uBoxMin.z); // 0..1
     float zc = zNorm * 2.0 - 1.0; // -1..1
-    // Wider bell — bleeds density further along z so each slice
-    // overlaps the next instead of stacking as a thin layer cake.
-    float profile = exp(-zc * zc * 1.6);
+    float profile = exp(-zc * zc * 2.5);
 
-    vec3 np = p * 1.8 + vec3(uTime * 0.05, uTime * 0.03, uTime * 0.12);
+    vec3 np = p * 2.2 + vec3(uTime * 0.05, uTime * 0.03, uTime * 0.12);
     float n = fbm3(np);
 
     // The noise modulates around 1, so density never drops to 0 inside
     // the glyph — the text always reads as a coherent shape, but with
     // puffy texture instead of a sharp ridge.
-    float puff = 0.55 + 0.75 * n;
+    float puff = 0.45 + 0.95 * n;
     return text * profile * puff;
   }
 
@@ -440,14 +414,11 @@ const fragmentShader = /* glsl */ `
       vec3 p = ro + rd * t;
       float d = density(p);
 
-      if (d > 0.005) {
+      if (d > 0.01) {
         float lt = lightMarch(p);
         vec3 emit = (lightCol * lt + ambient) * d;
         col += trans * emit * dt;
-        // Lower extinction coefficient than before so density
-        // accumulates more gradually — soft haze instead of crisp
-        // wafer-thin slabs.
-        trans *= exp(-d * dt * 3.8);
+        trans *= exp(-d * dt * 6.0);
         if (trans < 0.02) break;
       }
       t += dt;

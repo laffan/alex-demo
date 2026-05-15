@@ -3,26 +3,17 @@ import { markdown } from "https://esm.sh/@codemirror/lang-markdown@6.2.4";
 import * as THREE from "https://esm.sh/three@0.160.0";
 
 // ------------------------------------------------------------------
-// 0. Palette — fabric and shadow only.
+// 0. Palette — used as a fallback while pattern.jpg loads, and as a
+//    base tint that the printed pattern sits on.
 // ------------------------------------------------------------------
-const FABRIC_HEX = "#ecdcc6";
-const FABRIC_LIT_HEX = "#fbf4e6";
-const FABRIC_SHADE_HEX = "#bda88c";
+const FABRIC_HEX = "#fefcf7";
+const FABRIC_LIT_HEX = "#ffffff";
+const FABRIC_SHADE_HEX = "#bcc4d2";
 
 // ------------------------------------------------------------------
 // 1. Hidden CodeMirror editor.
 // ------------------------------------------------------------------
-const initialDoc = `UNDER THE FABRIC
-
-The shapes you type are
-geometry — small ridges
-of letterform pushing up
-under a single sheet of
-cloth. Type more, and
-the surface deforms
-cumulatively.
-
-Drag to select.`;
+const initialDoc = `"Yes, of course, if it's fine tomorrow," said Mrs. Ramsay.`;
 
 const view = new EditorView({
   doc: initialDoc,
@@ -232,6 +223,26 @@ const atlasTex = new THREE.CanvasTexture(texCanvas);
 atlasTex.minFilter = THREE.LinearFilter;
 atlasTex.magFilter = THREE.LinearFilter;
 
+// Printed fabric pattern. The shader samples this for surface colour
+// and the cloth lighting multiplies on top to give the bumps shading.
+// We start with a 1×1 white placeholder so the very first frame
+// renders something sensible (just the pale fabric tint) and swap in
+// the loaded jpg as soon as it arrives.
+const fabricTex = new THREE.DataTexture(
+  new Uint8Array([255, 255, 255, 255]),
+  1,
+  1,
+  THREE.RGBAFormat,
+);
+fabricTex.needsUpdate = true;
+new THREE.TextureLoader().load("./pattern.jpg", (loaded) => {
+  loaded.wrapS = loaded.wrapT = THREE.RepeatWrapping;
+  loaded.colorSpace = THREE.SRGBColorSpace;
+  loaded.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  loaded.needsUpdate = true;
+  material.uniforms.uFabricTex.value = loaded;
+});
+
 // ------------------------------------------------------------------
 // 4. Cloth simulation — GPU ping-pong between two float RTs at
 //    SIM_RES. Each cell stores (height, velocity, _, _). The sim
@@ -429,28 +440,14 @@ const vertexShader = /* glsl */ `
 
 const fragmentShader = /* glsl */ `
   precision highp float;
+  uniform sampler2D uFabricTex;
+  uniform vec2 uFabricRepeat;
   uniform vec3 uFabric;
   uniform vec3 uFabricLit;
   uniform vec3 uFabricShade;
   uniform vec3 uLightDir;
   varying vec3 vWorldPos;
   varying vec2 vAtlasUv;
-
-  float hash12(vec2 p) {
-    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-  }
-  float vn(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
-    float a = hash12(i);
-    float b = hash12(i + vec2(1.0, 0.0));
-    float c = hash12(i + vec2(0.0, 1.0));
-    float d = hash12(i + vec2(1.0, 1.0));
-    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
-  }
 
   void main() {
     vec3 dPdx = dFdx(vWorldPos);
@@ -459,17 +456,25 @@ const fragmentShader = /* glsl */ `
 
     vec3 L = normalize(uLightDir);
     float ndl = dot(normal, L);
+    // Wrap-shading: shadows lift slightly off pure black so the
+    // pattern stays legible inside ridges, highlights stay below
+    // 1 so the cloth doesn't go washed-out white at the peaks.
     float wrap = clamp((ndl + 0.45) / 1.45, 0.0, 1.0);
+    float lighting = mix(0.55, 1.10, smoothstep(0.0, 1.0, wrap));
 
-    vec3 col = mix(uFabricShade, uFabric, smoothstep(0.0, 0.55, wrap));
-    col = mix(col, uFabricLit, smoothstep(0.55, 1.0, wrap));
+    // Sample the printed pattern. Tiled in atlas-uv so the print
+    // tracks the page rather than the camera — when the doc scrolls,
+    // the pattern scrolls with it.
+    vec3 print = texture2D(uFabricTex, vAtlasUv * uFabricRepeat).rgb;
+    // Fallback tint mixed in below 1.0 lighting so the cloth has
+    // a recognisable colour even before pattern.jpg loads.
+    vec3 base = mix(uFabricShade, mix(uFabric, uFabricLit, 0.5), wrap);
+    vec3 col = mix(base, print, 0.92) * lighting;
 
-    float weave = vn(gl_FragCoord.xy * 0.6);
-    col += (weave - 0.5) * 0.018;
-
+    // Soft vignette toward the corners.
     vec2 centred = (vAtlasUv - 0.5);
-    float vig = smoothstep(0.85, 0.25, length(centred));
-    col = mix(col * 0.92, col, vig);
+    float vig = smoothstep(0.95, 0.25, length(centred));
+    col = mix(col * 0.88, col, vig);
 
     gl_FragColor = vec4(col, 1.0);
   }
@@ -481,6 +486,12 @@ const material = new THREE.ShaderMaterial({
     uHeight: { value: 0.085 },
     uOrigin: { value: new THREE.Vector2(0.5, 0.5) },
     uViewSize: { value: new THREE.Vector2(0.7, 0.7) },
+    uFabricTex: { value: fabricTex },
+    // How many times the pattern tile repeats across the atlas.
+    // The pattern jpg is itself a seamless repeat so any value tiles
+    // cleanly; ~3.5 keeps individual blooms readable without making
+    // them feel postage-stamp small.
+    uFabricRepeat: { value: new THREE.Vector2(3.5, 3.5) },
     uFabric: { value: new THREE.Color(FABRIC_HEX) },
     uFabricLit: { value: new THREE.Color(FABRIC_LIT_HEX) },
     uFabricShade: { value: new THREE.Color(FABRIC_SHADE_HEX) },
@@ -513,11 +524,14 @@ const camOrigin = new THREE.Vector2(0.5, 0.5);
 
 function updateViewSize() {
   const aspect = window.innerWidth / window.innerHeight;
-  // Pulled back: a larger atlas window means we see more text and
-  // surrounding cloth per screen, which reads as a more zoomed-out
-  // camera.
+  // Aspect-preserving: viewSize.x / viewSize.y must equal the screen
+  // aspect or the (square) atlas pixels render as non-square pixels
+  // on screen — earlier we clamped x to 0.98 which made each pixel
+  // wider than tall on a widescreen, squashing the text vertically.
+  // Past the atlas edges the texture is clamp-to-edge black (cloth
+  // stays at rest), so over-scanning x is visually harmless.
   const baseH = 0.96;
-  viewSize.set(Math.min(0.98, baseH * aspect), Math.min(0.98, baseH));
+  viewSize.set(baseH * aspect, baseH);
   material.uniforms.uViewSize.value.copy(viewSize);
 }
 

@@ -4,12 +4,12 @@ import * as THREE from "https://esm.sh/three@0.160.0";
 import RAPIER from "https://esm.sh/@dimforge/rapier3d-compat@0.13.0";
 
 // ------------------------------------------------------------------
-// 0. Palette — pale grey ground, stones in a range of blues.
+// 0. Palette — almost-white ground, stones in a range of blues.
 // ------------------------------------------------------------------
-const SKY_HEX = "#eeeeee";
-const HORIZON_HEX = "#c8c8c8";
-const GROUND_HEX = "#e8e8e8";
-const GROUND_DEEP_HEX = "#b8b8b8";
+const SKY_HEX = "#fafafa";
+const HORIZON_HEX = "#e0e0e0";
+const GROUND_HEX = "#f6f6f6";
+const GROUND_DEEP_HEX = "#cdcdcd";
 
 // Two anchor blues; per-stone tint randomly slides between them so
 // the pile reads as many shades of one colour family rather than a
@@ -28,15 +28,9 @@ await RAPIER.init();
 //   - docDirty: rebuild the terrain heightfield when text changes.
 //   - selectionDirty: rebuild rock tints when selection range changes.
 // ------------------------------------------------------------------
-const initialDoc = `STONES
+const initialDoc = `If falling hurts;
 
-type. the ground digs
-itself into letter-
-shaped troughs and
-rocks rain from above
-to fill them.
-
-delete to fill in.`;
+Why do people fall in love?`;
 
 let docDirty = true;
 let selectionDirty = true;
@@ -474,7 +468,17 @@ function rebuildHeightfield() {
       // canvas y=0 to map to world -Z (j=0 in Rapier local frame).
       // Rapier local Z runs -scale.z/2 to +scale.z/2 as j goes 0..ncols-1.
       // So j = cy (top of canvas = top/back of world).
-      heights[cx + cy * nrows] = v;
+      //
+      // Heights are *inverted* relative to the visual mesh: the
+      // vertex shader does `transformed.y -= h * uIndentDepth`, so
+      // text dips down visually. Rapier reads heights as displacement
+      // *above* local origin (height 1 = +scale.y), so storing v
+      // directly puts the physical surface at +scale.y where the
+      // visual surface is at -scale.y — rocks then settle on letter-
+      // shaped bumps and look embedded inside the visible troughs.
+      // Storing (1 - v) flips the physical surface to match the
+      // visual: text becomes a real trough that rocks fall into.
+      heights[cx + cy * nrows] = 1.0 - v;
     }
   }
   heightTex.needsUpdate = true;
@@ -555,7 +559,7 @@ function rebuildSelectionTint() {
 //    once a rock leaves the play area or sinks under the page it's
 //    despawned and its slot becomes eligible for reuse.
 // ------------------------------------------------------------------
-const MAX_ROCKS = 1800;
+const MAX_ROCKS = 3600;
 const ROCK_R = 0.06;
 
 // Slightly squashed icosahedra so they don't all look like perfect
@@ -739,10 +743,10 @@ resize();
 //   - Step Rapier and copy each rock's pose into the InstancedMesh.
 //   - Despawn rocks that fell off the page.
 // ------------------------------------------------------------------
-// Spawn rate is driven by typingActivity. Idle baseline is a slow
+// Spawn rate is driven by typingActivity. Idle baseline is a steady
 // drizzle; the rate ramps up to a downpour when text is flowing in.
-const SPAWN_INTERVAL_IDLE = 0.20;  // ~5 rocks/sec when nobody is typing
-const SPAWN_INTERVAL_BUSY = 0.010; // ~100 rocks/sec at peak typing
+const SPAWN_INTERVAL_IDLE = 0.10;  // ~10 rocks/sec when nobody is typing
+const SPAWN_INTERVAL_BUSY = 0.005; // ~200 rocks/sec at peak typing
 let spawnAcc = 0;
 
 function isInSelection(rb) {
