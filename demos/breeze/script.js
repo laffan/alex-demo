@@ -9,6 +9,7 @@ import * as THREE from "https://esm.sh/three@0.160.0";
 // ------------------------------------------------------------------
 const GROUND_HEX = "#1a1c22";
 const FILL_LIGHT_HEX = "#a4b3c6";
+const SELECT_HEX = "#4a90e2";
 
 // ------------------------------------------------------------------
 // 1. Hidden CodeMirror editor. Each insertion at the end of the doc
@@ -25,6 +26,7 @@ const view = new EditorView({
     markdown(),
     EditorView.updateListener.of((u) => {
       if (u.docChanged) syncDoc();
+      if (u.docChanged || u.selectionSet) syncSelection();
     }),
   ],
   parent: document.getElementById("editor-host"),
@@ -38,8 +40,16 @@ view.focus();
 //    so the letterforms have chunky strokes that read clearly even
 //    when the cloth folds.
 // ------------------------------------------------------------------
-const MASK_RES = 22;          // cloth grid resolution per letter
-const MASK_FONT = '900 30px "Bowlby One", "Inter", sans-serif';
+// Mask resolution is what the letterforms get rasterised into; it
+// doubles as the cloth's particle grid. 22 was just coarse enough
+// that strokes looked roughly chopped out of a stencil — 40 gives
+// the curves of Bowlby One a recognizable shape (~2.7× the
+// particle/spring count, still cheap at this scale).
+const MASK_RES = 40;
+// Font size must fit inside MASK_RES with margin for ascenders + descenders.
+// Bowlby One paints close to its full em-box; ~32px keeps an 'h' or 'g'
+// fully inside the 40px canvas instead of getting clipped to a square.
+const MASK_FONT = '900 32px "Bowlby One", "Inter", sans-serif';
 
 const maskCanvas = document.createElement("canvas");
 maskCanvas.width = MASK_RES;
@@ -82,7 +92,7 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(GROUND_HEX);
-scene.fog = new THREE.Fog(GROUND_HEX, 8, 22);
+scene.fog = new THREE.Fog(GROUND_HEX, 14, 32);
 
 const camera = new THREE.PerspectiveCamera(
   44,
@@ -90,7 +100,10 @@ const camera = new THREE.PerspectiveCamera(
   0.1,
   60,
 );
-camera.position.set(0, 7.5, 0.001);
+// Pulled back so the first row of typed letters (which spawn near
+// X = -((COLS_PER_LINE-1) * CHAR_ADV) / 2) is comfortably inside the
+// visible frustum on standard window aspects.
+camera.position.set(0, 12.0, 0.001);
 camera.lookAt(0, 0, 0);
 
 // Lights. A keylight from the side gives the falling letters
@@ -152,16 +165,27 @@ scene.add(ground);
 //                        we stop simulating this cloth (huge win for
 //                        long docs).
 // ------------------------------------------------------------------
-const CELL = 0.045;      // world units per mask cell
+// CELL scales inversely with MASK_RES so each letter's world size
+// stays roughly the same as before the resolution bump
+// (MASK_RES * CELL ≈ 0.99 world units across).
+const CELL = 0.025;
 const CLOTH_THICKNESS = 0.005;
 const GRAVITY = -7.0;
 const SUBSTEPS = 3;
 const CONSTRAINT_ITERS = 5;
 // Wind direction & magnitude: a gentle, time-varying breeze from
 // the top of the screen (the -Z direction in world space because
-// the camera looks straight down).
-const WIND_BASE = new THREE.Vector3(0.0, 0.0, 1.8);
-const WIND_VARY_AMP = 1.0;
+// the camera looks straight down). Kept low enough that a grounded
+// cloth's residual jitter drops under SETTLE_VEL_THRESHOLD and the
+// settle latch can fire; the old values (1.8 / 1.0) kept landed
+// cloths in perpetual wobble, which read as them re-falling whenever
+// a fresh letter dropped nearby.
+const WIND_BASE = new THREE.Vector3(0.0, 0.0, 0.55);
+const WIND_VARY_AMP = 0.25;
+// Above this height, a particle is treated as airborne and receives
+// wind; below it, it's "lying on the page" and wind is suppressed so
+// settled cloths stop drifting.
+const WIND_GROUND_CUTOFF = CLOTH_THICKNESS * 4;
 const SETTLE_VEL_THRESHOLD = 0.0008;
 const SETTLE_FRAMES = 60;
 
@@ -188,7 +212,7 @@ class Cloth {
         // above the ground in Y.
         const wx = spawnX + (x - M / 2) * CELL;
         const wz = spawnZ + (y - M / 2) * CELL;
-        const wy = 3.0 + Math.random() * 0.2;
+        const wy = 1.5 + Math.random() * 0.1;
         this.idxMap[y * M + x] = positions.length / 3;
         positions.push(wx, wy, wz);
         uvs.push(x / (M - 1), 1 - y / (M - 1));
@@ -276,6 +300,8 @@ class Cloth {
       metalness: 0.02,
       side: THREE.DoubleSide,
     });
+    this.mat = mat;
+    this.selected = false;
     this.geom = geom;
     this.mesh = new THREE.Mesh(geom, mat);
     this.mesh.castShadow = true;
@@ -316,9 +342,16 @@ class Cloth {
       prev[i] = x;
       prev[i + 1] = y;
       prev[i + 2] = z;
-      const nx = x + dx * damp + ax;
+      // Wind only acts on airborne particles. Once a particle is
+      // resting on the page, suppressing wind lets the residual
+      // velocity bleed off via the ground-damp step and the cloth
+      // can actually reach the settle threshold.
+      const airborne = y > WIND_GROUND_CUTOFF;
+      const wx_ = airborne ? ax : 0;
+      const wz_ = airborne ? az : 0;
+      const nx = x + dx * damp + wx_;
       const ny = y + dy * damp + gravStep;
-      const nz = z + dz * damp + az;
+      const nz = z + dz * damp + wz_;
       pos[i] = nx;
       pos[i + 1] = ny;
       pos[i + 2] = nz;
@@ -390,6 +423,15 @@ class Cloth {
     }
   }
 
+  setSelected(on) {
+    if (on === this.selected) return;
+    this.selected = on;
+    // Tint the linen texture by multiplying it with a blue when the
+    // char falls inside the editor's selection range. The texture
+    // remains visible — the cloth just reads as dyed fabric.
+    this.mat.color.set(on ? SELECT_HEX : 0xffffff);
+  }
+
   dispose() {
     scene.remove(this.mesh);
     this.geom.dispose();
@@ -405,12 +447,96 @@ class Cloth {
 // ------------------------------------------------------------------
 const CHAR_ADV = MASK_RES * CELL * 0.85;
 const LINE_PITCH = MASK_RES * CELL * 1.15;
-const COLS_PER_LINE = 14;
+// Narrowed from 14 so the leftmost cloth (at -((COLS-1)*CHAR_ADV)/2)
+// sits comfortably inside the camera frustum on near-square windows;
+// wider screens still get the rest of the page through the horizontal
+// FOV widening with aspect.
+const COLS_PER_LINE = 12;
 const START_X = -((COLS_PER_LINE - 1) * CHAR_ADV) / 2;
 const START_Z = -((4 - 1) * LINE_PITCH) / 2;
 
 let activeCloths = []; // parallel to currently-displayed printable chars
 let lastSyncedText = "";
+
+// Caret marker. A small blue sphere floating just above the page at
+// the slot where the next typed character would land. We render it
+// with a touch of emissive so it stays readable against the dark
+// ground even when the key light is grazing.
+const cursorMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(0.07, 20, 16),
+  new THREE.MeshStandardMaterial({
+    color: SELECT_HEX,
+    emissive: SELECT_HEX,
+    emissiveIntensity: 0.55,
+    roughness: 0.35,
+    metalness: 0.1,
+  }),
+);
+cursorMesh.castShadow = true;
+// Rest on the page: sphere centre = its radius above y=0.
+cursorMesh.position.set(0, 0.07, 0);
+scene.add(cursorMesh);
+
+// Point light parented to the cursor so its glow spills onto nearby
+// cloths — gives the sphere the impression of being a real source of
+// light rather than just a tinted material.
+const cursorLight = new THREE.PointLight(SELECT_HEX, 2.4, 3.5, 1.8);
+cursorLight.position.set(0, 0.35, 0);
+scene.add(cursorLight);
+
+function caretSlot() {
+  // Walk the doc up to the caret position and return the (col, row)
+  // of the slot the next-typed char would occupy. Mirrors the wrap
+  // logic in layoutFor so the sphere lines up with where a new cloth
+  // would actually spawn.
+  const pos = view.state.selection.main.head;
+  const text = view.state.doc.toString();
+  let col = 0;
+  let row = 0;
+  for (let i = 0; i < pos && i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\n") {
+      col = 0;
+      row++;
+      continue;
+    }
+    if (col >= COLS_PER_LINE) {
+      col = 0;
+      row++;
+    }
+    col++;
+  }
+  if (col >= COLS_PER_LINE) {
+    col = 0;
+    row++;
+  }
+  return { col, row };
+}
+
+function syncSelection() {
+  const sel = view.state.selection.main;
+  const from = Math.min(sel.anchor, sel.head);
+  const to = Math.max(sel.anchor, sel.head);
+  const text = view.state.doc.toString();
+
+  // Map [from, to) in doc-space onto cloth indices (skipping the
+  // non-printable chars that don't get a cloth).
+  let clothIdx = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\n" || ch === " ") continue;
+    if (clothIdx < activeCloths.length) {
+      activeCloths[clothIdx].setSelected(i >= from && i < to);
+    }
+    clothIdx++;
+  }
+
+  const { col, row } = caretSlot();
+  cursorMesh.position.x = START_X + col * CHAR_ADV;
+  cursorMesh.position.z = START_Z + row * LINE_PITCH;
+  cursorLight.position.x = cursorMesh.position.x;
+  cursorLight.position.z = cursorMesh.position.z;
+}
 
 function layoutFor(text) {
   // Returns an array of {char, col, row} for every printable char in
@@ -443,51 +569,44 @@ function syncDoc() {
   const text = view.state.doc.toString();
   const slots = layoutFor(text);
 
-  // Backspace fast path: new text is a prefix of the last sync. Just
-  // dispose cloths from the end until our count matches — keeps
-  // already-settled cloths in place.
-  if (
-    text.length < lastSyncedText.length &&
-    lastSyncedText.startsWith(text)
+  // Find the longest common prefix between the previously-synced
+  // text and the new text. Everything before the divergence point is
+  // unchanged — those cloths stay settled in place. Everything from
+  // the divergence point onward is disposed and respawned.
+  //
+  // Earlier the function only had startsWith fast paths for
+  // append/backspace-at-end; any other edit (mid-doc insertion, a
+  // selection-then-replace, a click-and-type that put the caret away
+  // from the end) fell through to a full rebuild, which made every
+  // already-settled letter drop again. The prefix-based approach
+  // handles all of those cases correctly *and* keeps only the
+  // genuinely-changed characters in motion.
+  let prefixLen = 0;
+  const limit = Math.min(text.length, lastSyncedText.length);
+  while (
+    prefixLen < limit &&
+    text.charCodeAt(prefixLen) === lastSyncedText.charCodeAt(prefixLen)
   ) {
-    while (activeCloths.length > slots.length) {
-      activeCloths.pop().dispose();
-    }
-    lastSyncedText = text;
-    return;
+    prefixLen++;
+  }
+  // Convert the doc-character prefix length to a cloth-index
+  // survivor count (spaces / newlines are not represented as cloths).
+  const survivors = layoutFor(text.slice(0, prefixLen)).length;
+
+  while (activeCloths.length > survivors) {
+    activeCloths.pop().dispose();
   }
 
-  // Append-only fast path: new text is the previous text plus extra
-  // characters on the end. Spawn fresh cloths for the new slots and
-  // leave the existing ones alone.
-  if (
-    text.length >= lastSyncedText.length &&
-    text.startsWith(lastSyncedText)
-  ) {
-    for (let i = activeCloths.length; i < slots.length; i++) {
-      const s = slots[i];
-      const x = START_X + s.col * CHAR_ADV;
-      const z = START_Z + s.row * LINE_PITCH;
-      // Stagger drops by ~80 ms so very fast typing still reads as
-      // a sequence rather than a single cloud falling at once.
-      const dropDelay = 0.08 * (i - activeCloths.length);
-      activeCloths.push(new Cloth(s.char, x, z, dropDelay));
-    }
-    lastSyncedText = text;
-    return;
-  }
-
-  // General-case (mid-doc edit, paste, undo, etc): drop everything
-  // and rebuild from scratch. Loses settled positions but is
-  // correctness-safe.
-  for (const c of activeCloths) c.dispose();
-  activeCloths = [];
-  for (let i = 0; i < slots.length; i++) {
+  for (let i = activeCloths.length; i < slots.length; i++) {
     const s = slots[i];
     const x = START_X + s.col * CHAR_ADV;
     const z = START_Z + s.row * LINE_PITCH;
-    activeCloths.push(new Cloth(s.char, x, z, 0.05 * i));
+    // Stagger drops by ~80 ms so very fast typing still reads as
+    // a sequence rather than a single cloud falling at once.
+    const dropDelay = 0.08 * (i - activeCloths.length);
+    activeCloths.push(new Cloth(s.char, x, z, dropDelay));
   }
+
   lastSyncedText = text;
 }
 
@@ -602,6 +721,12 @@ function tick() {
     }
     accumulator -= FIXED_DT;
   }
+  // Cursor pulse. Scale stays at 1 so the sphere remains seated on
+  // the page; instead we breathe the emissive and the point-light
+  // intensity together so the glow visibly throbs across the cloth.
+  const pulse = 0.85 + 0.25 * Math.sin(t * 3.0);
+  cursorMesh.material.emissiveIntensity = 0.6 * pulse + 0.35;
+  cursorLight.intensity = 2.0 * pulse + 1.1;
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
@@ -610,5 +735,6 @@ document.fonts.load(`900 30px "Bowlby One"`).then(() => {
   // Invalidate any masks we generated with the fallback font.
   maskCache.clear();
   syncDoc();
+  syncSelection();
   tick();
 });

@@ -26,9 +26,10 @@ letters.
    warp so the cloud visibly boils on top of its volumetrics.
 3. **[stone-letters](demos/stone-letters/)** — the text canvas is
    converted into a Rapier 3D heightfield; small stones (smoothed
-   icosahedra) rain from above and pile up inside the letter-shaped
-   troughs. Pale ground, blue-shade stones, friction tuned for
-   rolling. Spawn rate scales with a decaying typing-activity meter.
+   icosahedra) drop above each typed letter and fill the trough that
+   keystroke just carved. Pale ground, blue-shade stones, low
+   friction so each burst slides off the trough walls into the
+   indentation.
 4. **[fabric-text](demos/fabric-text/)** — a piece of woven linen
    (image-textured) sitting over the document. A GPU-side cloth
    simulation pushes the surface up where text glyphs sit

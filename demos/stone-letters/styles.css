@@ -9,8 +9,8 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #f6f6f6;
-  color: #1b2230;
+  background: #1c2638;
+  color: #d8b88a;
   font-family: "Bowlby One", "Inter", sans-serif;
 }
 
@@ -36,21 +36,4 @@ body {
   height: 1600px;
   pointer-events: none;
   z-index: 0;
-}
-
-#hint {
-  position: fixed;
-  bottom: 18px;
-  left: 0;
-  right: 0;
-  text-align: center;
-  font-size: 11px;
-  letter-spacing: 0.25em;
-  text-transform: uppercase;
-  color: #1b2230;
-  opacity: 0.5;
-  pointer-events: none;
-  z-index: 2;
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    sans-serif;
 }

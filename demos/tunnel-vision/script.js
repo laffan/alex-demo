@@ -36,15 +36,53 @@ const LINE_HEIGHT = 200;
 const PADDING = 160;
 const FONT_FAMILY = '"Archivo Black", "Inter", sans-serif';
 
-let cursorBlink = true;
-setInterval(() => {
-  cursorBlink = !cursorBlink;
-}, 530);
-
 let scrollTopRow = 0;
 let visualRows = [];
 let cursorAtlasPx = TEX * 0.5;
 let cursorAtlasPy = TEX * 0.5;
+
+// Atlas channel convention:
+//   R — density (text, cursor block, selection rect)
+//   G — emission strength (cursor glow + random-letter glow)
+//   B — selection tint (adds to density via the shader's *0.65 mix)
+// The shader treats G as a self-luminous cyan additive term so glowing
+// letters and the cursor read as light *coming from* the cloud, not
+// just brighter density.
+
+// Random-letter glow. Each event targets a doc position and runs a
+// sine envelope so the letter ramps up to a soft peak and back to 0.
+// We key by docPos rather than (row, col) so the events survive edits;
+// if the doc shrinks past a docPos, that event simply paints nothing.
+const glowEvents = [];
+let nextGlowSpawnT = 0;
+const LETTER_GLOW_PEAK = 110; // out of 255; well under the cursor's peak
+
+function updateGlowEvents(t) {
+  if (t >= nextGlowSpawnT) {
+    const text = view.state.doc.toString();
+    if (text.length > 0) {
+      // Pick a non-whitespace char to glow. Whitespace would put glow
+      // into a pixel that has no glyph anyway, which is wasted.
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const pos = Math.floor(Math.random() * text.length);
+        if (!/\s/.test(text[pos])) {
+          glowEvents.push({
+            docPos: pos,
+            t0: t,
+            duration: 1.6 + Math.random() * 2.0,
+          });
+          break;
+        }
+      }
+    }
+    nextGlowSpawnT = t + 0.35 + Math.random() * 0.9;
+  }
+  for (let i = glowEvents.length - 1; i >= 0; i--) {
+    if (t - glowEvents[i].t0 >= glowEvents[i].duration) {
+      glowEvents.splice(i, 1);
+    }
+  }
+}
 
 function lineStyle(text) {
   const h = /^(#{1,6})\s+/.exec(text);
@@ -125,11 +163,12 @@ function findCursorRow(rows, head) {
   return best;
 }
 
-// We paint into R for glyphs/cursor and B for selection. The
-// raymarch reads R as "main cloud density" and B as a tint shift —
-// it doesn't need separate channels for cursor vs glyph, the cursor
-// is just bright white that blinks in/out.
-function renderTexture() {
+// Paint the doc into the atlas. R carries density, B carries
+// selection (the shader thickens cloud where B is high), and G carries
+// emission strength used by the shader to add a self-luminous cyan
+// term. Regular glyphs paint pure red so G stays 0 except where we
+// explicitly want a glow.
+function renderTexture(t) {
   tctx.fillStyle = "#000";
   tctx.fillRect(0, 0, TEX, TEX);
 
@@ -158,7 +197,7 @@ function renderTexture() {
     const baseline = y + s.size * 0.85;
 
     if (s.bar && row.isFirstInLine) {
-      tctx.fillStyle = "#ffffff";
+      tctx.fillStyle = "#ff0000";
       tctx.fillRect(PADDING - 40, y + 12, 14, s.size - 24);
     }
 
@@ -169,12 +208,53 @@ function renderTexture() {
       const x2 = PADDING + tctx.measureText(row.text.slice(0, endCol)).width;
       const extendsPastRow = selTo > row.endDocPos;
       const xEnd = extendsPastRow ? TEX - PADDING : Math.max(x2, x1 + 30);
-      tctx.fillStyle = "#6a86ff";
+      // Pure-blue rect — the shader reads B as additional density, so
+      // this still thickens the cloud over the selection. Keeping G=0
+      // here means selection doesn't accidentally glow.
+      tctx.fillStyle = "#0000ff";
       tctx.fillRect(x1, y, xEnd - x1, s.size + 20);
     }
 
-    tctx.fillStyle = "#ffffff";
-    tctx.fillText(row.text, PADDING, baseline);
+    // Find any glow events whose docPos falls inside this row, so we
+    // can paint those characters with a non-zero G channel.
+    const rowGlows = [];
+    for (const g of glowEvents) {
+      if (g.docPos >= row.startDocPos && g.docPos < row.endDocPos) {
+        const col = g.docPos - row.startDocPos;
+        if (col >= 0 && col < row.text.length && !/\s/.test(row.text[col])) {
+          const phase = (t - g.t0) / g.duration;
+          const env = Math.sin(phase * Math.PI); // 0 → 1 → 0
+          rowGlows.push({ col, env });
+        }
+      }
+    }
+
+    if (rowGlows.length === 0) {
+      tctx.fillStyle = "#ff0000";
+      tctx.fillText(row.text, PADDING, baseline);
+    } else {
+      rowGlows.sort((a, b) => a.col - b.col);
+      let cursorCol = 0;
+      let x = PADDING;
+      for (const g of rowGlows) {
+        if (g.col > cursorCol) {
+          const seg = row.text.slice(cursorCol, g.col);
+          tctx.fillStyle = "#ff0000";
+          tctx.fillText(seg, x, baseline);
+          x += tctx.measureText(seg).width;
+        }
+        const ch = row.text[g.col];
+        const gVal = Math.max(0, Math.round(g.env * LETTER_GLOW_PEAK));
+        tctx.fillStyle = `rgb(255, ${gVal}, 0)`;
+        tctx.fillText(ch, x, baseline);
+        x += tctx.measureText(ch).width;
+        cursorCol = g.col + 1;
+      }
+      if (cursorCol < row.text.length) {
+        tctx.fillStyle = "#ff0000";
+        tctx.fillText(row.text.slice(cursorCol), x, baseline);
+      }
+    }
 
     if (r === cursorRowIdx) {
       const localCol = Math.min(
@@ -190,10 +270,14 @@ function renderTexture() {
       cursorAtlasPx = PADDING + wBefore + blockWidth * 0.5;
       cursorAtlasPy = y + s.size * 0.5;
 
-      if (cursorBlink) {
-        tctx.fillStyle = "#aeefff";
-        tctx.fillRect(PADDING + wBefore, y + 20, blockWidth, s.size - 20);
-      }
+      // Continuous pulse instead of a blink — the cursor is now a
+      // persistent glow that breathes. G goes from ~80 to ~255 so it
+      // always reads as a bright source, peaking well above the
+      // letters' LETTER_GLOW_PEAK.
+      const pulse = 0.65 + 0.35 * Math.sin(t * 3.2);
+      const gVal = Math.round(80 + 175 * pulse);
+      tctx.fillStyle = `rgb(255, ${gVal}, 0)`;
+      tctx.fillRect(PADDING + wBefore, y + 20, blockWidth, s.size - 20);
     }
 
     y += LINE_HEIGHT;
@@ -327,22 +411,23 @@ const fragmentShader = /* glsl */ `
     return uv + vec2(fx, fy) * amp;
   }
 
-  // Sample volume density at world-space point p.
-  // - Map p.xy to atlas uv via the camera-pan transform.
-  // - Wobble that uv with the heat-shimmer field.
-  // - Smooth bell-curve along z so density tapers at front/back.
-  // - 3D fbm puffiness, animated by uTime.
-  float density(vec3 p) {
+  // Sample volume at world-space point p. Returns (density, emission).
+  // - density drives the cloud's optical thickness (R + tinted B).
+  // - emission drives a self-luminous cyan additive term in the main
+  //   raymarch (G channel from the atlas — cursor + glow letters).
+  // Both share the z profile + fbm puff so emission looks like it
+  // belongs to the same cloud as the surrounding density.
+  vec2 sampleVolume(vec3 p) {
     vec2 boxUv = (p.xy - uBoxMin.xy) / (uBoxMax.xy - uBoxMin.xy);
     vec2 atlasUv = uOrigin + (boxUv - 0.5) * uViewSize;
     float zNorm = (p.z - uBoxMin.z) / (uBoxMax.z - uBoxMin.z); // 0..1
     atlasUv = wobble(atlasUv, zNorm);
     if (atlasUv.x < 0.0 || atlasUv.x > 1.0 || atlasUv.y < 0.0 || atlasUv.y > 1.0) {
-      return 0.0;
+      return vec2(0.0);
     }
     vec4 tex = texture2D(uTex, atlasUv);
     float text = max(tex.r, tex.b * 0.65);
-    if (text < 0.02) return 0.0;
+    if (text < 0.02) return vec2(0.0);
 
     float zc = zNorm * 2.0 - 1.0; // -1..1
     float profile = exp(-zc * zc * 2.5);
@@ -350,11 +435,12 @@ const fragmentShader = /* glsl */ `
     vec3 np = p * 2.2 + vec3(uTime * 0.05, uTime * 0.03, uTime * 0.12);
     float n = fbm3(np);
 
-    // The noise modulates around 1, so density never drops to 0 inside
-    // the glyph — the text always reads as a coherent shape, but with
-    // puffy texture instead of a sharp ridge.
     float puff = 0.45 + 0.95 * n;
-    return text * profile * puff;
+    return vec2(text * profile * puff, tex.g * profile * puff);
+  }
+
+  float density(vec3 p) {
+    return sampleVolume(p).x;
   }
 
   // March from p toward the light a short way, accumulating density.
@@ -410,14 +496,23 @@ const fragmentShader = /* glsl */ `
     vec3 col = vec3(0.0);
     float trans = 1.0;
 
+    // Emissive colour for the cursor + glowing letters. Cyan-blue
+    // so it reads as a luminous shaft rising out of the cloud-text;
+    // pow on g compresses the dim letters and stretches the cursor's
+    // peak, so the brightness gap between the two is obvious.
+    vec3 glowCol = vec3(0.45, 0.90, 1.10);
+
     for (int s = 0; s < STEPS; s++) {
       vec3 p = ro + rd * t;
-      float d = density(p);
+      vec2 sm = sampleVolume(p);
+      float d = sm.x;
+      float g = sm.y;
 
-      if (d > 0.01) {
+      if (d > 0.01 || g > 0.01) {
         float lt = lightMarch(p);
         vec3 emit = (lightCol * lt + ambient) * d;
-        col += trans * emit * dt;
+        vec3 glow = glowCol * pow(g, 1.35) * 4.0;
+        col += trans * (emit + glow) * dt;
         trans *= exp(-d * dt * 6.0);
         if (trans < 0.02) break;
       }
@@ -609,15 +704,17 @@ window.addEventListener("resize", resize);
 resize();
 
 function initCamera() {
-  renderTexture();
+  renderTexture(0);
   camOrigin.copy(targetOrigin());
   material.uniforms.uOrigin.value.copy(camOrigin);
 }
 
 const clock = new THREE.Clock();
 function tick() {
-  material.uniforms.uTime.value = clock.getElapsedTime();
-  renderTexture();
+  const t = clock.getElapsedTime();
+  material.uniforms.uTime.value = t;
+  updateGlowEvents(t);
+  renderTexture(t);
   texture.needsUpdate = true;
 
   camOrigin.copy(targetOrigin());

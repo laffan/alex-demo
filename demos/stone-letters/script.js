@@ -4,19 +4,21 @@ import * as THREE from "https://esm.sh/three@0.160.0";
 import RAPIER from "https://esm.sh/@dimforge/rapier3d-compat@0.13.0";
 
 // ------------------------------------------------------------------
-// 0. Palette — almost-white ground, stones in a range of blues.
+// 0. Palette — dark slate-blue ground, stones in a range of warm
+//    browns. Inverted from the original light-page / blue-stones
+//    treatment: the dark background pushes each lit stone forward.
 // ------------------------------------------------------------------
-const SKY_HEX = "#fafafa";
-const HORIZON_HEX = "#e0e0e0";
-const GROUND_HEX = "#f6f6f6";
-const GROUND_DEEP_HEX = "#cdcdcd";
+const SKY_HEX = "#1c2638";
+const HORIZON_HEX = "#0e1422";
+const GROUND_HEX = "#1c2638";
+const GROUND_DEEP_HEX = "#0c1322";
 
-// Two anchor blues; per-stone tint randomly slides between them so
+// Two anchor browns; per-stone tint randomly slides between them so
 // the pile reads as many shades of one colour family rather than a
-// single uniform blue.
-const ROCK_BASE_HEX = "#1c3354";
-const ROCK_HI_HEX = "#8db8e6";
-const ROCK_SELECT_HEX = "#d68a2c";
+// single uniform tone.
+const ROCK_BASE_HEX = "#6b4a2a";
+const ROCK_HI_HEX = "#d8b88a";
+const ROCK_SELECT_HEX = "#4ea3c4";
 
 // Wait for the Rapier WASM blob to decode before doing anything else.
 // The compat build embeds the WASM as base64 so we don't need a
@@ -35,11 +37,19 @@ Why do people fall in love?`;
 let docDirty = true;
 let selectionDirty = true;
 
-// Typing-activity meter. Each doc change adds a pulse; the meter
-// decays exponentially each frame. We use it to drive the rock spawn
-// rate so the rain accelerates while you're typing and slows back
-// to a trickle when you stop.
-let typingActivity = 0;
+// Stones spawn per-keystroke: each inserted printable character
+// drops a small grid of stones over that letter's strokes. Each stone
+// remembers the doc position of its parent character, and when that
+// character is later deleted the stones tied to it are flagged to
+// fade out (see stoneMeta + the docChange handler below).
+const pendingSpawns = []; // [docPos, ...] queued for the next tick
+
+// Resolved grid positions waiting on their cascade-stagger timer.
+// Each entry: { wx, wy, wz, docPos, spawnAt (ms) }. Drained each frame
+// in the animation loop; cancelled / remapped from the docChange
+// handler so deleting a letter mid-cascade halts its pending drops.
+const pendingDrops = [];
+const CASCADE_DURATION_MS = 1000;
 
 const view = new EditorView({
   doc: initialDoc,
@@ -49,13 +59,41 @@ const view = new EditorView({
     EditorView.updateListener.of((u) => {
       if (u.docChanged) {
         docDirty = true;
-        // Sum up the size of inserted+deleted text so paste / large
-        // edits register as a bigger burst than a single keypress.
-        let chars = 0;
+        // 1. Any stone whose docPos lies inside a *deleted* range
+        //    loses its letter — mark it fading.
         u.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
-          chars += inserted.length + (toA - fromA);
+          if (toA > fromA) {
+            for (const m of stoneMeta) {
+              if (!m.fading && m.docPos >= fromA && m.docPos < toA) {
+                m.fading = true;
+                m.fadeStart = performance.now();
+              }
+            }
+            // Drop any queued drops whose parent letter just got deleted.
+            for (let i = pendingDrops.length - 1; i >= 0; i--) {
+              const p = pendingDrops[i];
+              if (p.docPos >= fromA && p.docPos < toA) {
+                pendingDrops.splice(i, 1);
+              }
+            }
+          }
+          // Queue inserts for spawning (positions in NEW doc).
+          const s = inserted.toString();
+          for (let i = 0; i < s.length; i++) {
+            const ch = s.charAt(i);
+            if (ch === "\n" || ch === " " || ch === "\t") continue;
+            pendingSpawns.push(fromB + i);
+          }
         });
-        typingActivity = Math.min(typingActivity + Math.max(1, chars), 30);
+        // 2. Surviving stones + queued drops: remap their doc positions
+        //    through the transaction so they continue to point at the
+        //    same letter after the document shifts.
+        for (const m of stoneMeta) {
+          if (!m.fading) m.docPos = u.changes.mapPos(m.docPos, 1);
+        }
+        for (const p of pendingDrops) {
+          p.docPos = u.changes.mapPos(p.docPos, 1);
+        }
       }
       if (u.selectionSet) selectionDirty = true;
     }),
@@ -211,11 +249,12 @@ scene.background = new THREE.Color(GROUND_HEX);
 scene.fog = new THREE.Fog(GROUND_HEX, 10, 22);
 
 // Soft hemisphere fill, plus a low key sun that casts shadows. The
-// raking sun is what makes the rocks read as rocks rather than as
-// flat circles — it gives each one a visible shadow on the ground.
+// sun sits nearly overhead so each stone's shadow lands directly
+// under it — a low raking sun reads as the stones hovering above the
+// page because the shadow projects several centimetres away.
 scene.add(new THREE.HemisphereLight(0xfff4d4, GROUND_DEEP_HEX, 0.55));
 const sun = new THREE.DirectionalLight(0xfff3c8, 1.4);
-sun.position.set(4.5, 7.0, 3.2);
+sun.position.set(2.0, 9.0, 1.5);
 sun.castShadow = true;
 sun.shadow.camera.left = -6;
 sun.shadow.camera.right = 6;
@@ -426,12 +465,19 @@ let terrainCollider = null;
 // local Z axis: we want world -Z to be "top of doc", which means
 // the Rapier vertex at j=0 corresponds to world -Z extreme, which
 // is canvas y=0.
+// The downsampled atlas, cached at module scope so the per-keystroke
+// stone burst can reject-sample its spawn positions against actual
+// stroke pixels (rather than the letter's geometric centre, which
+// for hollow letters like O/A/D is *not* a trough).
+let atlasSamples = null;
+
 function rebuildHeightfield() {
   renderTextToCanvas();
   sctx.fillStyle = "#000";
   sctx.fillRect(0, 0, HMAP_RES, HMAP_RES);
   sctx.drawImage(texCanvas, 0, 0, HMAP_RES, HMAP_RES);
   const data = sctx.getImageData(0, 0, HMAP_RES, HMAP_RES).data;
+  atlasSamples = data;
 
   // Build two arrays:
   //   - heightTexData: for the visual mesh's vertex displacement.
@@ -464,21 +510,25 @@ function rebuildHeightfield() {
       const v = sampleSmoothed(cx, cy);
       heightTexData[cy * HMAP_RES + cx] = v;
 
-      // Rapier index: i = cx (X), j corresponds to local-Z. We want
-      // canvas y=0 to map to world -Z (j=0 in Rapier local frame).
-      // Rapier local Z runs -scale.z/2 to +scale.z/2 as j goes 0..ncols-1.
-      // So j = cy (top of canvas = top/back of world).
+      // Rapier / parry3d heightfields use (i, j) where i is the row
+      // index along *local Z* and j is the column index along
+      // *local X* (verified against parry3d's heightfield3.rs:
+      // `x = -0.5 + cell_width * j`, `z = -0.5 + cell_height * i`).
+      // Column-major flat layout: heights[i + j * nrows].
+      //
+      // We want canvas X (cx) → world X and canvas Y (cy) → world Z,
+      // so i = cy and j = cx ⇒ flat index = cy + cx * nrows.
       //
       // Heights are *inverted* relative to the visual mesh: the
       // vertex shader does `transformed.y -= h * uIndentDepth`, so
-      // text dips down visually. Rapier reads heights as displacement
-      // *above* local origin (height 1 = +scale.y), so storing v
-      // directly puts the physical surface at +scale.y where the
-      // visual surface is at -scale.y — rocks then settle on letter-
-      // shaped bumps and look embedded inside the visible troughs.
-      // Storing (1 - v) flips the physical surface to match the
-      // visual: text becomes a real trough that rocks fall into.
-      heights[cx + cy * nrows] = 1.0 - v;
+      // text dips down visually. Rapier's heightfield is
+      // bottom-anchored — a stored height of 0 sits at the body
+      // origin, 1 sits at body.y + scale.y. Storing (1 - v) gives a
+      // surface of *height 1* at non-text and *height 0* at text.
+      // With the body at y = -INDENT_DEPTH (below), the non-text
+      // surface lands at world y = 0 and trough floors at y =
+      // -INDENT_DEPTH, exactly matching the visual displacement.
+      heights[cy + cx * nrows] = 1.0 - v;
     }
   }
   heightTex.needsUpdate = true;
@@ -494,17 +544,11 @@ function rebuildHeightfield() {
   )
     .setFriction(0.55)
     .setRestitution(0.05);
-  // Rapier 3D heightfields are *centered* on their local Y axis:
-  // height = 1.0 sits at +scale.y/2 above the body origin, height
-  // = 0.0 sits at -scale.y/2 below it. Combined with our height
-  // values (1 - v, so non-text vertices = 1, text vertices = 0),
-  // putting the body at y = -INDENT_DEPTH/2 lands the non-text
-  // surface at world y=0 and the bottom of a text trough at world
-  // y=-INDENT_DEPTH — i.e., exactly where the visual mesh draws
-  // them. Earlier we had the body at -INDENT_DEPTH on the
-  // assumption that heights were bottom-anchored; that's what was
-  // making stones look submerged half a depth into the surface.
-  hfDesc.setTranslation(0, -INDENT_DEPTH / 2, 0);
+  // See the height-encoding comment above: the heightfield is
+  // bottom-anchored, so dropping the body to -INDENT_DEPTH places the
+  // non-text vertices (stored = 1) at world y=0 and the text vertices
+  // (stored = 0) at world y=-INDENT_DEPTH.
+  hfDesc.setTranslation(0, -INDENT_DEPTH, 0);
   terrainCollider = world.createCollider(hfDesc, terrainBody);
 }
 
@@ -564,13 +608,12 @@ function rebuildSelectionTint() {
 //    despawned and its slot becomes eligible for reuse.
 // ------------------------------------------------------------------
 const MAX_ROCKS = 3600;
-const ROCK_R = 0.045;
+const ROCK_R = 0.0225;
 
-// Subdivision-1 icosahedron (80 faces vs. the base 20). Smoother
-// silhouette + closer-to-spherical inertia tensor means each stone
-// rolls along the page instead of skidding to a halt on whichever
-// flat face happens to land down.
-const rockGeo = new THREE.IcosahedronGeometry(ROCK_R, 1);
+// Subdivision-2 icosahedron (320 faces). At detail=1 the polygonal
+// silhouette is just visible enough that each stone reads as
+// hovering above its shadow; the smoother shape closes that gap.
+const rockGeo = new THREE.IcosahedronGeometry(ROCK_R, 2);
 const rockMat = new THREE.MeshStandardMaterial({
   color: 0xffffff,
   roughness: 0.78,
@@ -589,58 +632,205 @@ rocks.count = 0;
 scene.add(rocks);
 
 const rockBodies = []; // parallel to rocks[i]
+// Parallel to rockBodies. Each entry tracks the parent letter so
+// stones can fade away when their character is deleted.
+//   docPos    — current doc position of the parent character (remapped
+//               through every transaction)
+//   fading    — once true, this stone is on its way out
+//   fadeStart — performance.now() when fading began
+//   collider  — Rapier collider handle, used to turn off contacts at
+//               fade start so the dying stone doesn't shove neighbours
+const stoneMeta = [];
 const dummy = new THREE.Object3D();
 const dummyColor = new THREE.Color();
 const baseRock = new THREE.Color(ROCK_BASE_HEX);
 const hiRock = new THREE.Color(ROCK_HI_HEX);
 const selRock = new THREE.Color(ROCK_SELECT_HEX);
 
-function spawnRock() {
-  if (rockBodies.length >= MAX_ROCKS) return;
-  // Even rain across the whole page so every letter trough has a
-  // chance to fill; with no slope to traffic stones forward they
-  // settle wherever they happen to land.
-  const x = (Math.random() - 0.5) * (PAGE_SIZE * 0.92);
-  const z = (Math.random() - 0.5) * (PAGE_SIZE * 0.92);
-  const y = 2.0 + Math.random() * 0.5;
+const FADE_DURATION_MS = 450;
 
+function spawnRockAt(x, y, z, docPos, originX, originZ) {
+  if (rockBodies.length >= MAX_ROCKS) return;
   const rbDesc = RAPIER.RigidBodyDesc.dynamic()
     .setTranslation(x, y, z)
     .setLinvel(
-      (Math.random() - 0.5) * 0.25,
+      (Math.random() - 0.5) * 0.08,
       0,
-      (Math.random() - 0.5) * 0.25,
+      (Math.random() - 0.5) * 0.08,
     )
     .setAngvel({
       x: (Math.random() - 0.5) * 4,
       y: (Math.random() - 0.5) * 2,
       z: (Math.random() - 0.5) * 4,
     })
-    // Continuous collision detection — without it, fast stones
-    // tunnel through the thin heightfield and disappear underneath.
     .setCcdEnabled(true);
   const rb = world.createRigidBody(rbDesc);
 
-  const rScale = 0.8 + Math.random() * 0.6;
-  // Moderate friction lets stones roll on impact but still settles
-  // them into deep letter troughs instead of bouncing back out.
+  const rScale = 0.85 + Math.random() * 0.4;
+  // Higher density (5.0 vs the old 2.0) makes each stone *feel*
+  // heavier on impact — they thunk into the trough instead of
+  // bouncing around like marbles. Friction stays low so anything
+  // landing on a stroke wall still rolls inward.
   const cd = RAPIER.ColliderDesc.ball(ROCK_R * rScale)
-    .setFriction(0.55)
-    .setRestitution(0.08)
-    .setDensity(2.0);
-  world.createCollider(cd, rb);
+    .setFriction(0.25)
+    .setRestitution(0.05)
+    .setDensity(5.0);
+  const collider = world.createCollider(cd, rb);
 
   rb.__rockTint = Math.random();
   rb.__rockScale = rScale;
   rockBodies.push(rb);
+  stoneMeta.push({
+    docPos,
+    fading: false,
+    fadeStart: 0,
+    collider,
+    // World offset from the parent letter's current centre. Stored so
+    // we can translate the stone alongside its letter whenever the
+    // document re-flows (e.g. a word wraps to a new line).
+    offsetX: x - originX,
+    offsetZ: z - originZ,
+    lastOriginX: originX,
+    lastOriginZ: originZ,
+  });
+}
+
+// World-space centre of the character at docPos in the *current*
+// layout, or null if it isn't in the visible scrolled region. The
+// stone-cascade spawn and the per-frame "stones follow their letter"
+// translation both read from this.
+function letterWorldCenter(docPos) {
+  if (visualRows.length === 0) return null;
+  let rowIdx = -1;
+  for (let i = 0; i < visualRows.length; i++) {
+    const r = visualRows[i];
+    if (r.startDocPos <= docPos && docPos < r.endDocPos) {
+      rowIdx = i;
+      break;
+    }
+    if (r.startDocPos <= docPos && docPos === r.endDocPos) rowIdx = i;
+  }
+  if (rowIdx < 0) return null;
+  const visibleRowCount = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
+  if (rowIdx < scrollTopRow || rowIdx >= scrollTopRow + visibleRowCount) {
+    return null;
+  }
+  const row = visualRows[rowIdx];
+  const col = Math.max(0, Math.min(row.text.length - 1, docPos - row.startDocPos));
+  setFont();
+  const x1 = PADDING + tctx.measureText(row.text.slice(0, col)).width;
+  const x2 = PADDING + tctx.measureText(row.text.slice(0, col + 1)).width;
+  const cx = (x1 + x2) / 2;
+  const cy = PADDING + (rowIdx - scrollTopRow) * LINE_HEIGHT + FONT_SIZE * 0.5;
+  return {
+    x: (cx / TEX - 0.5) * PAGE_SIZE,
+    z: (cy / TEX - 0.5) * PAGE_SIZE,
+  };
+}
+
+// Spacing between grid cells, in world units. Sized so two stones
+// fit comfortably across a typical Bowlby One stroke (~0.18 wide at
+// FONT_SIZE=110) without overlapping at spawn.
+const GRID_SPACING_WORLD = 0.075;
+
+// Drop a regular grid of stones over the typed letter's strokes.
+// The grid is sized to the glyph's atlas bounding box — wide letters
+// get more stones than narrow ones — and each grid cell only spawns
+// a stone if the cell's centre lands on an actual stroke pixel in
+// the rasterised atlas (so hollow centres in O / A / D / B don't
+// produce stones that miss the trough entirely).
+function spawnBurstAtDocPos(docPos) {
+  if (visualRows.length === 0 || !atlasSamples) return false;
+  let rowIdx = -1;
+  for (let i = 0; i < visualRows.length; i++) {
+    const r = visualRows[i];
+    if (r.startDocPos <= docPos && docPos < r.endDocPos) {
+      rowIdx = i;
+      break;
+    }
+    // Type at end-of-row falls into endDocPos; accept the last match.
+    if (r.startDocPos <= docPos && docPos === r.endDocPos) rowIdx = i;
+  }
+  if (rowIdx < 0) return false;
+  const visibleRowCount = Math.floor((TEX - 2 * PADDING) / LINE_HEIGHT);
+  if (rowIdx < scrollTopRow || rowIdx >= scrollTopRow + visibleRowCount) {
+    return false;
+  }
+
+  const row = visualRows[rowIdx];
+  const col = Math.max(0, Math.min(row.text.length - 1, docPos - row.startDocPos));
+  setFont();
+  // Glyph bounding box in atlas (TEX-space) pixels. X from the
+  // measured advance widths; Y spans the row's text band.
+  const x1 = PADDING + tctx.measureText(row.text.slice(0, col)).width;
+  const x2 = PADDING + tctx.measureText(row.text.slice(0, col + 1)).width;
+  const rowTopY = PADDING + (rowIdx - scrollTopRow) * LINE_HEIGHT;
+  const yTop = rowTopY + FONT_SIZE * 0.05;
+  const yBot = rowTopY + FONT_SIZE * 0.95;
+
+  // Translate the world-units grid spacing into atlas pixels.
+  const stepPx = GRID_SPACING_WORLD * TEX / PAGE_SIZE;
+  const nx = Math.max(1, Math.round((x2 - x1) / stepPx));
+  const ny = Math.max(1, Math.round((yBot - yTop) / stepPx));
+  const dx = (x2 - x1) / nx;
+  const dy = (yBot - yTop) / ny;
+  const jitterPx = stepPx * 0.18;
+
+  // Letter centre, used as the *anchor* the resulting stones are
+  // stored relative to. If the letter later wraps to a new line we
+  // can re-place every stone by its (offsetX, offsetZ) from the
+  // letter's updated centre.
+  const origin = letterWorldCenter(docPos);
+  if (!origin) return false;
+
+  // Collect every grid cell that lands on a stroke pixel, then
+  // shuffle so the cascade reads as a scattering of drops rather
+  // than a left-to-right wipe.
+  const slots = [];
+  for (let gy = 0; gy < ny; gy++) {
+    for (let gx = 0; gx < nx; gx++) {
+      const sx = x1 + (gx + 0.5) * dx + (Math.random() - 0.5) * jitterPx;
+      const sy = yTop + (gy + 0.5) * dy + (Math.random() - 0.5) * jitterPx;
+      const hx = Math.max(0, Math.min(HMAP_RES - 1, Math.floor(sx * HMAP_RES / TEX)));
+      const hy = Math.max(0, Math.min(HMAP_RES - 1, Math.floor(sy * HMAP_RES / TEX)));
+      if (atlasSamples[(hy * HMAP_RES + hx) * 4] < 120) continue;
+      const wx = (sx / TEX - 0.5) * PAGE_SIZE;
+      const wz = (sy / TEX - 0.5) * PAGE_SIZE;
+      slots.push({ offsetX: wx - origin.x, offsetZ: wz - origin.z });
+    }
+  }
+  for (let i = slots.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = slots[i]; slots[i] = slots[j]; slots[j] = tmp;
+  }
+
+  const baseTime = performance.now();
+  for (let i = 0; i < slots.length; i++) {
+    const s = slots[i];
+    const tFrac = slots.length > 1 ? i / (slots.length - 1) : 0;
+    pendingDrops.push({
+      offsetX: s.offsetX,
+      offsetZ: s.offsetZ,
+      // Low drop — stones release from just above the page so they
+      // settle into the trough they were aimed at instead of bouncing
+      // back out from a hard landing.
+      wy: 0.30 + Math.random() * 0.08,
+      docPos,
+      spawnAt: baseTime + tFrac * CASCADE_DURATION_MS,
+    });
+  }
+  return slots.length > 0;
 }
 
 function despawnRock(i) {
   const rb = rockBodies[i];
   world.removeRigidBody(rb);
-  // Swap-remove
-  rockBodies[i] = rockBodies[rockBodies.length - 1];
+  // Swap-remove, keeping stoneMeta in lockstep with rockBodies.
+  const last = rockBodies.length - 1;
+  rockBodies[i] = rockBodies[last];
   rockBodies.pop();
+  stoneMeta[i] = stoneMeta[last];
+  stoneMeta.pop();
 }
 
 // ------------------------------------------------------------------
@@ -745,18 +935,13 @@ resize();
 // ------------------------------------------------------------------
 // 10. Animation loop.
 //
-//   - If the doc changed, rebuild the terrain heightfield + texture.
+//   - If the doc changed, rebuild the terrain heightfield + texture,
+//     then drain any pending per-keystroke stone bursts so they spawn
+//     against the *new* letter positions.
 //   - If only the selection changed, rebuild just the tint texture.
-//   - Spawn a few rocks per frame until we hit the population cap.
 //   - Step Rapier and copy each rock's pose into the InstancedMesh.
 //   - Despawn rocks that fell off the page.
 // ------------------------------------------------------------------
-// Spawn rate is driven by typingActivity. Idle baseline is a steady
-// drizzle; the rate ramps up to a downpour when text is flowing in.
-const SPAWN_INTERVAL_IDLE = 0.10;  // ~10 rocks/sec when nobody is typing
-const SPAWN_INTERVAL_BUSY = 0.005; // ~200 rocks/sec at peak typing
-let spawnAcc = 0;
-
 function isInSelection(rb) {
   // Project the rock's xz back into the canvas plane and read the
   // selection texture. Cheap proxy — close enough for tint purposes.
@@ -774,34 +959,75 @@ function tick(now) {
     rebuildSelectionTint();
     docDirty = false;
     selectionDirty = false;
+    // Now that visualRows reflects the latest text, drop the queued
+    // bursts onto each typed letter.
+    if (pendingSpawns.length > 0) {
+      for (const docPos of pendingSpawns) spawnBurstAtDocPos(docPos);
+      pendingSpawns.length = 0;
+    }
+    // Stones follow their letter through layout changes (word wrap,
+    // text re-flow). For each non-fading stone, recompute its parent
+    // letter's current centre and translate the body by the delta
+    // since we last placed it.
+    const originByDocPos = new Map();
+    for (let i = 0; i < rockBodies.length; i++) {
+      const m = stoneMeta[i];
+      if (m.fading) continue;
+      let origin = originByDocPos.get(m.docPos);
+      if (origin === undefined) {
+        origin = letterWorldCenter(m.docPos);
+        originByDocPos.set(m.docPos, origin);
+      }
+      if (!origin) continue; // off-screen; leave the stone in place
+      const dx = origin.x - m.lastOriginX;
+      const dz = origin.z - m.lastOriginZ;
+      if (Math.abs(dx) > 1e-4 || Math.abs(dz) > 1e-4) {
+        const rb = rockBodies[i];
+        const p = rb.translation();
+        rb.setTranslation({ x: p.x + dx, y: p.y, z: p.z + dz }, true);
+        m.lastOriginX = origin.x;
+        m.lastOriginZ = origin.z;
+      }
+    }
   } else if (selectionDirty) {
     rebuildSelectionTint();
     selectionDirty = false;
   }
 
-  const dt = 1 / 60;
-
-  // Decay the typing meter. Half-life of roughly one second so a
-  // burst of typing keeps the rain heavy for a few seconds afterwards.
-  typingActivity *= Math.exp(-dt * 0.7);
-  const busyness = Math.min(1, typingActivity / 12);
-  const spawnInterval =
-    SPAWN_INTERVAL_IDLE +
-    (SPAWN_INTERVAL_BUSY - SPAWN_INTERVAL_IDLE) * busyness;
-
-  spawnAcc += dt;
-  while (spawnAcc >= spawnInterval) {
-    spawnRock();
-    spawnAcc -= spawnInterval;
-  }
-
   world.step();
 
-  // Cull rocks that ran out of bounds (off the page edge, under the
-  // floor) and copy survivors into the instance buffer.
-  let writeIdx = 0;
+  const nowMs = performance.now();
+
+  // Drain the cascade queue: spawn any stones whose stagger timer
+  // has elapsed. Each drop holds an offset *from its letter's centre*
+  // so a letter that wrapped between queuing and spawning still gets
+  // its stones in the right place.
+  for (let i = pendingDrops.length - 1; i >= 0; i--) {
+    const d = pendingDrops[i];
+    if (d.spawnAt > nowMs) continue;
+    const origin = letterWorldCenter(d.docPos);
+    if (!origin) {
+      // Letter scrolled out of view before its stone could spawn —
+      // drop the entry rather than dumping stones at world origin.
+      pendingDrops.splice(i, 1);
+      continue;
+    }
+    spawnRockAt(
+      origin.x + d.offsetX,
+      d.wy,
+      origin.z + d.offsetZ,
+      d.docPos,
+      origin.x,
+      origin.z,
+    );
+    pendingDrops.splice(i, 1);
+  }
+
+  // First pass (reverse): cull rocks that fell off the page and any
+  // fading rocks whose fade duration has elapsed.
   for (let i = rockBodies.length - 1; i >= 0; i--) {
     const rb = rockBodies[i];
+    const m = stoneMeta[i];
     const t = rb.translation();
     if (
       t.y < -3 ||
@@ -809,15 +1035,38 @@ function tick(now) {
       Math.abs(t.z) > PAGE_SIZE * 0.7
     ) {
       despawnRock(i);
+      continue;
+    }
+    if (m.fading && nowMs - m.fadeStart >= FADE_DURATION_MS) {
+      despawnRock(i);
     }
   }
+
+  // Second pass: write transforms + colours. Just-marked fading
+  // stones get their collider switched to a sensor so they stop
+  // shoving neighbours while they shrink out.
+  let writeIdx = 0;
   for (let i = 0; i < rockBodies.length && writeIdx < MAX_ROCKS; i++) {
     const rb = rockBodies[i];
+    const m = stoneMeta[i];
     const t = rb.translation();
     const q = rb.rotation();
+
+    let fadeScale = 1;
+    if (m.fading) {
+      if (!m.sensorSet) {
+        m.collider.setSensor(true);
+        m.sensorSet = true;
+      }
+      const u = Math.min(1, (nowMs - m.fadeStart) / FADE_DURATION_MS);
+      // Ease-in cubic so the shrink starts gentle and accelerates;
+      // a linear ramp reads as the stones snapping out.
+      fadeScale = 1 - u * u * u;
+    }
+
     dummy.position.set(t.x, t.y, t.z);
     dummy.quaternion.set(q.x, q.y, q.z, q.w);
-    dummy.scale.setScalar(rb.__rockScale);
+    dummy.scale.setScalar(rb.__rockScale * fadeScale);
     dummy.updateMatrix();
     rocks.setMatrixAt(writeIdx, dummy.matrix);
 
@@ -825,9 +1074,8 @@ function tick(now) {
     if (isInSelection(rb)) {
       dummyColor.copy(selRock);
     } else {
-      // Full lerp between the two anchor blues so the pile actually
-      // shows a visible spread of shades rather than crowding near
-      // the dark end.
+      // Full lerp between the two anchor browns so the pile shows a
+      // visible spread of tones rather than crowding near one end.
       dummyColor.copy(baseRock).lerp(hiRock, tone);
     }
     rocks.setColorAt(writeIdx, dummyColor);
@@ -846,5 +1094,14 @@ document.fonts.load(`${FONT_SIZE}px "Bowlby One"`).then(() => {
   rebuildSelectionTint();
   docDirty = false;
   selectionDirty = false;
+  // Seed bursts for every printable character already in the doc, so
+  // the page opens with stones filling the initial text instead of a
+  // bare set of empty troughs.
+  const seedText = view.state.doc.toString();
+  for (let i = 0; i < seedText.length; i++) {
+    const ch = seedText.charAt(i);
+    if (ch === "\n" || ch === " " || ch === "\t") continue;
+    spawnBurstAtDocPos(i);
+  }
   requestAnimationFrame(tick);
 });

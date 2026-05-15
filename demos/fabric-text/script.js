@@ -6,9 +6,9 @@ import * as THREE from "https://esm.sh/three@0.160.0";
 // 0. Palette — used as a fallback while pattern.jpg loads, and as a
 //    base tint that the printed pattern sits on.
 // ------------------------------------------------------------------
-const FABRIC_HEX = "#fefcf7";
+const FABRIC_HEX = "#eeeeee";
 const FABRIC_LIT_HEX = "#ffffff";
-const FABRIC_SHADE_HEX = "#bcc4d2";
+const FABRIC_SHADE_HEX = "#bdbdbd";
 
 // ------------------------------------------------------------------
 // 1. Hidden CodeMirror editor.
@@ -223,26 +223,6 @@ const atlasTex = new THREE.CanvasTexture(texCanvas);
 atlasTex.minFilter = THREE.LinearFilter;
 atlasTex.magFilter = THREE.LinearFilter;
 
-// Printed fabric pattern. The shader samples this for surface colour
-// and the cloth lighting multiplies on top to give the bumps shading.
-// We start with a 1×1 white placeholder so the very first frame
-// renders something sensible (just the pale fabric tint) and swap in
-// the loaded jpg as soon as it arrives.
-const fabricTex = new THREE.DataTexture(
-  new Uint8Array([255, 255, 255, 255]),
-  1,
-  1,
-  THREE.RGBAFormat,
-);
-fabricTex.needsUpdate = true;
-new THREE.TextureLoader().load("./pattern.jpg", (loaded) => {
-  loaded.wrapS = loaded.wrapT = THREE.RepeatWrapping;
-  loaded.colorSpace = THREE.SRGBColorSpace;
-  loaded.anisotropy = renderer.capabilities.getMaxAnisotropy();
-  loaded.needsUpdate = true;
-  material.uniforms.uFabricTex.value = loaded;
-});
-
 // ------------------------------------------------------------------
 // 4. Cloth simulation — GPU ping-pong between two float RTs at
 //    SIM_RES. Each cell stores (height, velocity, _, _). The sim
@@ -254,7 +234,7 @@ new THREE.TextureLoader().load("./pattern.jpg", (loaded) => {
 //    That's ~10 ms of JS work per frame on a fast laptop; on the
 //    GPU it's a single fragment shader pass and effectively free.
 // ------------------------------------------------------------------
-const SIM_RES = 256;
+const SIM_RES = 512;
 const FLOAT = renderer.capabilities.isWebGL2
   ? THREE.HalfFloatType
   : THREE.FloatType;
@@ -349,15 +329,20 @@ const simFS = /* glsl */ `
     // below its rest position.
     float push = max(target - h, 0.0);
 
-    // Firmer cloth: a lower tension coefficient (slower wave propagation
-    // away from the push) plus much heavier damping (faster decay of
-    // overshoot) means a freshly added letter rises in place rather
-    // than radiating a visible ripple outwards. Push force is reduced
-    // a touch too so the lift is graceful instead of springy.
-    float K_TENSION = 90.0;
-    float K_PUSH    = 180.0;
-    float DAMP      = 10.0;
-    float REST_PULL = 0.5;  // tiny pull toward zero when no push
+    // Tension is kept so the cloth reads as taut — the Laplacian
+    // coupling pulls neighbouring cells along, which is what makes
+    // the displacement bleed slightly past each letter and feel like
+    // fabric stretched over a shape, not embossed metal.
+    //
+    // Damping is set well above the critical value for the coupled
+    // system (2*sqrt(K_TENSION + K_PUSH) ≈ 33), so the wave equation
+    // degenerates toward a diffusion equation: neighbours still pull
+    // on each other but disturbances dissipate before they can
+    // oscillate. No visible ripples, but the taut-cloth shape remains.
+    float K_TENSION = 300.0;
+    float K_PUSH    = 10.0;
+    float DAMP      = 60.0;
+    float REST_PULL = 0.5;
     float restForce = (target < h) ? -REST_PULL * (h - target) : 0.0;
 
     float force = K_TENSION * lap + K_PUSH * push + restForce - DAMP * v;
@@ -412,7 +397,7 @@ function stepSim() {
 // A unit plane that we scale per-frame to overflow the viewport.
 // MESH_RES is the subdivision count — fixed independent of size so
 // the cloth detail stays consistent across monitor shapes.
-const MESH_RES = 320;
+const MESH_RES = 640;
 const planeGeo = new THREE.PlaneGeometry(1, 1, MESH_RES, MESH_RES);
 
 const vertexShader = /* glsl */ `
@@ -427,6 +412,9 @@ const vertexShader = /* glsl */ `
   void main() {
     vec2 atlasUv = uOrigin + (uv - 0.5) * uViewSize;
     vAtlasUv = atlasUv;
+    // Sample the height field directly. The cloth texture's bilinear
+    // filter already gives a smooth ramp between sim cells, and any
+    // extra Gaussian on top reads as pillowy.
     float h = texture2D(uCloth, atlasUv).r;
 
     vec3 pos = position;
@@ -440,8 +428,10 @@ const vertexShader = /* glsl */ `
 
 const fragmentShader = /* glsl */ `
   precision highp float;
-  uniform sampler2D uFabricTex;
-  uniform vec2 uFabricRepeat;
+  uniform sampler2D uCloth;
+  uniform float uHeight;
+  uniform vec2 uViewSize;
+  uniform vec2 uMeshScale;
   uniform vec3 uFabric;
   uniform vec3 uFabricLit;
   uniform vec3 uFabricShade;
@@ -449,29 +439,36 @@ const fragmentShader = /* glsl */ `
   varying vec3 vWorldPos;
   varying vec2 vAtlasUv;
 
+  // Analytic per-pixel normal from the height field. Sampling at
+  // ±2 sim-texels gives a smooth central difference; converting the
+  // atlas-uv step to a world-space slope needs the mesh's world size
+  // (uMeshScale) and the camera-pan scale (uViewSize), because the
+  // plane is stretched to fill the viewport.
+  vec3 heightNormal() {
+    const float step = 1.0 / 256.0; // 1 cell of SIM_RES = 256
+    float hL = texture2D(uCloth, vAtlasUv + vec2(-step, 0.0)).r;
+    float hR = texture2D(uCloth, vAtlasUv + vec2( step, 0.0)).r;
+    float hD = texture2D(uCloth, vAtlasUv + vec2(0.0, -step)).r;
+    float hU = texture2D(uCloth, vAtlasUv + vec2(0.0,  step)).r;
+    // dHeight/dWorldX = (hR - hL) / (2*step) * uHeight * uViewSize.x / uMeshScale.x
+    float dx = (hR - hL) * uHeight * uViewSize.x / (2.0 * step * uMeshScale.x);
+    float dy = (hU - hD) * uHeight * uViewSize.y / (2.0 * step * uMeshScale.y);
+    return normalize(vec3(-dx, -dy, 1.0));
+  }
+
   void main() {
-    vec3 dPdx = dFdx(vWorldPos);
-    vec3 dPdy = dFdy(vWorldPos);
-    vec3 normal = normalize(cross(dPdx, dPdy));
+    vec3 normal = heightNormal();
 
     vec3 L = normalize(uLightDir);
     float ndl = dot(normal, L);
-    // Wrap-shading: shadows lift slightly off pure black so the
-    // pattern stays legible inside ridges, highlights stay below
-    // 1 so the cloth doesn't go washed-out white at the peaks.
     float wrap = clamp((ndl + 0.45) / 1.45, 0.0, 1.0);
     float lighting = mix(0.55, 1.10, smoothstep(0.0, 1.0, wrap));
 
-    // Sample the printed pattern. Tiled in atlas-uv so the print
-    // tracks the page rather than the camera — when the doc scrolls,
-    // the pattern scrolls with it.
-    vec3 print = texture2D(uFabricTex, vAtlasUv * uFabricRepeat).rgb;
-    // Fallback tint mixed in below 1.0 lighting so the cloth has
-    // a recognisable colour even before pattern.jpg loads.
+    // Flat tan cloth — no texture sample. The shade/lit gradient over
+    // the wrap term still gives the bumps their light/shadow definition.
     vec3 base = mix(uFabricShade, mix(uFabric, uFabricLit, 0.5), wrap);
-    vec3 col = mix(base, print, 0.92) * lighting;
+    vec3 col = base * lighting;
 
-    // Soft vignette toward the corners.
     vec2 centred = (vAtlasUv - 0.5);
     float vig = smoothstep(0.95, 0.25, length(centred));
     col = mix(col * 0.88, col, vig);
@@ -486,12 +483,10 @@ const material = new THREE.ShaderMaterial({
     uHeight: { value: 0.085 },
     uOrigin: { value: new THREE.Vector2(0.5, 0.5) },
     uViewSize: { value: new THREE.Vector2(0.7, 0.7) },
-    uFabricTex: { value: fabricTex },
-    // How many times the pattern tile repeats across the atlas.
-    // The pattern jpg is itself a seamless repeat so any value tiles
-    // cleanly; ~3.5 keeps individual blooms readable without making
-    // them feel postage-stamp small.
-    uFabricRepeat: { value: new THREE.Vector2(3.5, 3.5) },
+    // World-space size of the plane mesh — pushed in from sizePlane()
+    // and used by the fragment shader to convert atlas-uv gradients
+    // into world-space height slopes for the analytic normal.
+    uMeshScale: { value: new THREE.Vector2(1, 1) },
     uFabric: { value: new THREE.Color(FABRIC_HEX) },
     uFabricLit: { value: new THREE.Color(FABRIC_LIT_HEX) },
     uFabricShade: { value: new THREE.Color(FABRIC_SHADE_HEX) },
@@ -499,7 +494,6 @@ const material = new THREE.ShaderMaterial({
   },
   vertexShader,
   fragmentShader,
-  extensions: { derivatives: true },
 });
 
 const mesh = new THREE.Mesh(planeGeo, material);
@@ -514,6 +508,7 @@ function sizePlane() {
   const visH = 2 * camera.position.z * Math.tan(vFov / 2);
   const visW = visH * camera.aspect;
   mesh.scale.set(visW * 1.02, visH * 1.02, 1);
+  material.uniforms.uMeshScale.value.set(visW * 1.02, visH * 1.02);
 }
 
 // ------------------------------------------------------------------
