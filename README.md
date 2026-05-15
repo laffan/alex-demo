@@ -1,6 +1,6 @@
 # The Alex Demos
 
-So we get to talking about text editors.
+So we get to talking about text editors...
 
 ## The demos
 
