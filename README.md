@@ -1,18 +1,6 @@
 # The Alex Demos
 
-A small series of demos that take a real, functioning text editor —
-input, selection, undo, IME and all — and render its picture through
-a layer of WebGL. The editor brain is always a hidden CodeMirror
-instance; only what you see in front of it changes.
-
-The trick they all share: split the editor in two. A headless
-CodeMirror owns the document, the selection, and the history. A 2D
-canvas paints a stylised picture of its state every frame. WebGL
-treats *that canvas* as a texture — it never knows there's an editor
-on the other end. Some demos do more than paint that canvas onto a
-plane: they use it as a density field, an occlusion buffer for
-god-rays, a heightfield for physics, or a glyph atlas for cloth
-letters.
+So we get to talking about text editors.
 
 ## The demos
 
