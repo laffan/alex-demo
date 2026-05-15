@@ -9,8 +9,8 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #efe5cb;
-  color: #1f1209;
+  background: #272a2e;
+  color: #e8e2d3;
   font-family: "Trocchi", Georgia, serif;
 }
 
@@ -51,8 +51,8 @@ body {
   font-size: 11px;
   letter-spacing: 0.25em;
   text-transform: uppercase;
-  color: #1f1209;
-  opacity: 0.55;
+  color: #e8e2d3;
+  opacity: 0.45;
   pointer-events: none;
   z-index: 2;
   font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",

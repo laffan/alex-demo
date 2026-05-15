@@ -3,12 +3,12 @@ import { markdown } from "https://esm.sh/@codemirror/lang-markdown@6.2.4";
 import * as THREE from "https://esm.sh/three@0.160.0";
 
 // ------------------------------------------------------------------
-// 0. Palette — dark brown on light tan.
+// 0. Palette — pale ivory text on dark slate.
 // ------------------------------------------------------------------
-const BG_HEX = "#efe5cb";
-const FG_HEX = "#1f1209";
-const SELECTION_RGBA = "rgba(31, 18, 9, 0.22)";
-const BORDER_RGBA = "rgba(31, 18, 9, 0.18)";
+const BG_HEX = "#272a2e";
+const FG_HEX = "#e8e2d3";
+const SELECTION_RGBA = "rgba(232, 226, 211, 0.22)";
+const BORDER_RGBA = "rgba(232, 226, 211, 0.18)";
 
 // ------------------------------------------------------------------
 // 1. Hidden CodeMirror 6 editor (owns input, selection, history)

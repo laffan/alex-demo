@@ -231,6 +231,12 @@ scene.add(sun);
 // visual mesh has the same dimensions so the two stay in lockstep.
 const PAGE_SIZE = 7.0;
 const INDENT_DEPTH = 0.30;
+// Tilt the page slightly around the X axis (back edge up, front edge
+// down) so a stone landing at the top of the screen has somewhere to
+// roll *to*. Combined with rolling-friction tuning on the stones,
+// this turns the page into a gentle ramp that traffics them past
+// the letter troughs.
+const TILT_ANGLE = 0.10; // ~5.7°
 
 // Camera: looking down at an angle so we can see both the rock pile
 // and the surface they're forming. CAMERA_DIST pulled back so more
@@ -366,6 +372,9 @@ groundMat.onBeforeCompile = (shader) => {
 };
 const ground = new THREE.Mesh(planeGeo, groundMat);
 ground.receiveShadow = true;
+// Tilt the visual mesh — the matching tilt is applied to the Rapier
+// terrain body below so the two stay glued together.
+ground.rotation.x = TILT_ANGLE;
 scene.add(ground);
 
 // A larger "off-page" plane behind the active heightfield. Same
@@ -378,7 +387,7 @@ const outerGround = new THREE.Mesh(
     roughness: 0.97,
   }),
 );
-outerGround.rotation.x = -Math.PI / 2;
+outerGround.rotation.x = -Math.PI / 2 + TILT_ANGLE;
 // Sit below the deepest indent so it never occludes the heightfield
 // from the camera's angle — only visible *past* the page edges.
 outerGround.position.y = -INDENT_DEPTH - 0.15;
@@ -391,7 +400,19 @@ scene.add(outerGround);
 const world = new RAPIER.World({ x: 0, y: -12.0, z: 0 });
 world.integrationParameters.dt = 1 / 60;
 
-const terrainBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+// Same tilt as the visual mesh, expressed as a quaternion around the
+// world X axis. Rotating the body rotates every collider attached to
+// it, so the heightfield surface inherits the tilt automatically.
+const halfTilt = TILT_ANGLE * 0.5;
+const tiltRot = {
+  x: Math.sin(halfTilt),
+  y: 0,
+  z: 0,
+  w: Math.cos(halfTilt),
+};
+const terrainBody = world.createRigidBody(
+  RAPIER.RigidBodyDesc.fixed().setRotation(tiltRot),
+);
 let terrainCollider = null;
 
 // Walls around the page so rocks don't escape sideways. Four thin
@@ -492,7 +513,10 @@ function rebuildHeightfield() {
     heights,
     { x: PAGE_SIZE, y: INDENT_DEPTH, z: PAGE_SIZE },
   )
-    .setFriction(0.85)
+    // Match the rock friction so the slope can actually move stones
+    // forward — a stickier surface gripped them in place and they
+    // never reached the letter troughs.
+    .setFriction(0.45)
     .setRestitution(0.05);
   // Heightfield sits with its surface at y=0 (and dips down into
   // negative Y). Rapier's heightfield is centered on the rigid
@@ -560,14 +584,16 @@ function rebuildSelectionTint() {
 //    despawned and its slot becomes eligible for reuse.
 // ------------------------------------------------------------------
 const MAX_ROCKS = 3600;
-const ROCK_R = 0.06;
+const ROCK_R = 0.045;
 
-// Slightly squashed icosahedra so they don't all look like perfect
-// balls — gives the pile a more pebbly silhouette.
-const rockGeo = new THREE.IcosahedronGeometry(ROCK_R, 0);
+// Subdivision-1 icosahedron (80 faces vs. the base 20). Smoother
+// silhouette + closer-to-spherical inertia tensor means each stone
+// rolls along the page instead of skidding to a halt on whichever
+// flat face happens to land down.
+const rockGeo = new THREE.IcosahedronGeometry(ROCK_R, 1);
 const rockMat = new THREE.MeshStandardMaterial({
   color: 0xffffff,
-  roughness: 0.86,
+  roughness: 0.78,
   metalness: 0.04,
 });
 const rocks = new THREE.InstancedMesh(rockGeo, rockMat, MAX_ROCKS);
@@ -591,23 +617,28 @@ const selRock = new THREE.Color(ROCK_SELECT_HEX);
 
 function spawnRock() {
   if (rockBodies.length >= MAX_ROCKS) return;
-  // Spawn slightly above the page, with a small random spread, and
-  // a touch of horizontal velocity for visual interest.
-  const x = (Math.random() - 0.5) * (PAGE_SIZE * 0.95);
-  const z = (Math.random() - 0.5) * (PAGE_SIZE * 0.95);
-  const y = 2.0 + Math.random() * 0.6;
+  // Rain from the top of the screen — a thin strip along the back of
+  // the page so the rocks all enter from -Z. Combined with the
+  // page's tilt, that gives them a natural downhill trajectory:
+  // land near the back, roll forward through the letter troughs,
+  // and stack up against the front wall (or anything in between).
+  const x = (Math.random() - 0.5) * (PAGE_SIZE * 0.92);
+  const z = -PAGE_SIZE * 0.45 + Math.random() * (PAGE_SIZE * 0.08);
+  const y = 2.4 + Math.random() * 0.5;
 
   const rbDesc = RAPIER.RigidBodyDesc.dynamic()
     .setTranslation(x, y, z)
     .setLinvel(
-      (Math.random() - 0.5) * 0.4,
+      (Math.random() - 0.5) * 0.2,
       0,
-      (Math.random() - 0.5) * 0.4,
+      // Tiny forward kick so the first contact already has a hint
+      // of the downhill direction baked into it.
+      0.15 + Math.random() * 0.15,
     )
     .setAngvel({
-      x: (Math.random() - 0.5) * 3,
-      y: (Math.random() - 0.5) * 3,
-      z: (Math.random() - 0.5) * 3,
+      x: (Math.random() - 0.5) * 4,
+      y: (Math.random() - 0.5) * 2,
+      z: (Math.random() - 0.5) * 4,
     })
     // Continuous collision detection — without it, fast rocks
     // tunnel through the thin heightfield and disappear underneath.
@@ -615,10 +646,13 @@ function spawnRock() {
   const rb = world.createRigidBody(rbDesc);
 
   // Vary radius slightly per rock for visual texture.
-  const rScale = 0.7 + Math.random() * 0.7;
+  const rScale = 0.8 + Math.random() * 0.6;
+  // Friction tuned for *rolling* rather than gripping: low enough
+  // that the slope can keep the stone moving but high enough that
+  // a deep letter trough still catches and holds it.
   const cd = RAPIER.ColliderDesc.ball(ROCK_R * rScale)
-    .setFriction(0.95)
-    .setRestitution(0.08)
+    .setFriction(0.45)
+    .setRestitution(0.10)
     .setDensity(2.0);
   world.createCollider(cd, rb);
 
