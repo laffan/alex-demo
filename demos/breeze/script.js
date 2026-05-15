@@ -3,19 +3,20 @@ import { markdown } from "https://esm.sh/@codemirror/lang-markdown@6.2.4";
 import * as THREE from "https://esm.sh/three@0.160.0";
 
 // ------------------------------------------------------------------
-// 0. Palette.
+// 0. Palette. A dark slate ground; letter-shaped cloths are textured
+//    with the shared linen pattern so they read as actual scraps of
+//    fabric falling onto the page.
 // ------------------------------------------------------------------
-const BG_HEX = "#2c3038";
-const INK_HEX = "#1c2030";
+const GROUND_HEX = "#1a1c22";
+const FILL_LIGHT_HEX = "#a4b3c6";
 
 // ------------------------------------------------------------------
-// 1. Hidden CodeMirror editor. Each typed character maps to a small
-//    cloth-banner Mesh in the scene; the doc listener rebuilds the
-//    banner layout when the document changes.
+// 1. Hidden CodeMirror editor. Each insertion at the end of the doc
+//    spawns a fresh cloth letter at the next layout slot; each
+//    deletion at the end removes the last cloth. Mid-doc edits
+//    rebuild from scratch since the layout shifts.
 // ------------------------------------------------------------------
-const initialDoc = `the wind writes through the words`;
-
-let docDirty = true;
+const initialDoc = ``;
 
 const view = new EditorView({
   doc: initialDoc,
@@ -23,7 +24,7 @@ const view = new EditorView({
     basicSetup,
     markdown(),
     EditorView.updateListener.of((u) => {
-      if (u.docChanged) docDirty = true;
+      if (u.docChanged) syncDoc();
     }),
   ],
   parent: document.getElementById("editor-host"),
@@ -31,86 +32,85 @@ const view = new EditorView({
 view.focus();
 
 // ------------------------------------------------------------------
-// 2. Glyph atlas. One canvas with every printable ASCII glyph drawn
-//    in a fixed-size cell. Each per-character mesh later samples a
-//    sub-rect of this atlas via a (uGlyphUv, uGlyphSize) uniform.
+// 2. Letter mask generator. Each unique character gets rasterised
+//    once at high resolution into a binary mask: the cloth particles
+//    live only at "on" mask cells. Blocky sans-serif (Bowlby One)
+//    so the letterforms have chunky strokes that read clearly even
+//    when the cloth folds.
 // ------------------------------------------------------------------
-const GLYPH_COLS = 16;
-const GLYPH_ROWS = 8;
-const GLYPH_CELL = 256;
-const GLYPH_ATLAS_W = GLYPH_COLS * GLYPH_CELL;
-const GLYPH_ATLAS_H = GLYPH_ROWS * GLYPH_CELL;
+const MASK_RES = 22;          // cloth grid resolution per letter
+const MASK_FONT = '900 30px "Bowlby One", "Inter", sans-serif';
 
-const glyphCanvas = document.createElement("canvas");
-glyphCanvas.width = GLYPH_ATLAS_W;
-glyphCanvas.height = GLYPH_ATLAS_H;
-const gctx = glyphCanvas.getContext("2d");
+const maskCanvas = document.createElement("canvas");
+maskCanvas.width = MASK_RES;
+maskCanvas.height = MASK_RES;
+const mctx = maskCanvas.getContext("2d", { willReadFrequently: true });
 
-function renderGlyphAtlas() {
-  gctx.fillStyle = "#000";
-  gctx.fillRect(0, 0, GLYPH_ATLAS_W, GLYPH_ATLAS_H);
-  gctx.fillStyle = "#fff";
-  gctx.font = `700 200px "Cormorant Garamond", Georgia, serif`;
-  gctx.textAlign = "center";
-  gctx.textBaseline = "middle";
-  for (let code = 32; code < 32 + GLYPH_COLS * GLYPH_ROWS; code++) {
-    const idx = code - 32;
-    const col = idx % GLYPH_COLS;
-    const row = Math.floor(idx / GLYPH_COLS);
-    const x = col * GLYPH_CELL + GLYPH_CELL / 2;
-    const y = row * GLYPH_CELL + GLYPH_CELL / 2;
-    gctx.fillText(String.fromCharCode(code), x, y);
+const maskCache = new Map();
+function maskFor(ch) {
+  if (maskCache.has(ch)) return maskCache.get(ch);
+  mctx.fillStyle = "#000";
+  mctx.fillRect(0, 0, MASK_RES, MASK_RES);
+  mctx.fillStyle = "#fff";
+  mctx.font = MASK_FONT;
+  mctx.textBaseline = "middle";
+  mctx.textAlign = "center";
+  // Nudge baseline down a touch — most caps + descenders read better
+  // when the glyph sits slightly above the cell centre.
+  mctx.fillText(ch, MASK_RES / 2, MASK_RES / 2 + 1);
+  const img = mctx.getImageData(0, 0, MASK_RES, MASK_RES).data;
+  const mask = new Uint8Array(MASK_RES * MASK_RES);
+  for (let i = 0; i < MASK_RES * MASK_RES; i++) {
+    mask[i] = img[i * 4] > 96 ? 1 : 0;
   }
-}
-renderGlyphAtlas();
-
-const glyphTex = new THREE.CanvasTexture(glyphCanvas);
-glyphTex.minFilter = THREE.LinearMipMapLinearFilter;
-glyphTex.magFilter = THREE.LinearFilter;
-glyphTex.anisotropy = 4;
-// The default canvas-texture flipY = true means canvas Y=0 maps to UV
-// V=1. Our glyph-uv lookup compensates with `1 - (row+1)/ROWS`.
-
-function glyphUvFor(ch) {
-  const code = ch.charCodeAt(0);
-  if (code < 32 || code >= 32 + GLYPH_COLS * GLYPH_ROWS) return null;
-  const idx = code - 32;
-  const col = idx % GLYPH_COLS;
-  const row = Math.floor(idx / GLYPH_COLS);
-  return {
-    u: col / GLYPH_COLS,
-    // Canvas y=0 is the top, but UV v=0 is the bottom (after flipY).
-    // Compute the UV of the bottom-left of this glyph's cell.
-    v: 1 - (row + 1) / GLYPH_ROWS,
-    du: 1 / GLYPH_COLS,
-    dv: 1 / GLYPH_ROWS,
-  };
+  maskCache.set(ch, mask);
+  return mask;
 }
 
 // ------------------------------------------------------------------
-// 3. three.js setup.
+// 3. three.js setup. Top-down perspective camera so cloths drop
+//    *toward* the viewer (close at the moment of typing, smaller
+//    once they've settled flat against the ground).
 // ------------------------------------------------------------------
 const stage = document.getElementById("stage");
 const renderer = new THREE.WebGLRenderer({ canvas: stage, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight, false);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(BG_HEX);
+scene.background = new THREE.Color(GROUND_HEX);
+scene.fog = new THREE.Fog(GROUND_HEX, 8, 22);
 
 const camera = new THREE.PerspectiveCamera(
-  42,
+  44,
   window.innerWidth / window.innerHeight,
   0.1,
-  100,
+  60,
 );
-camera.position.set(0, 0, 5.5);
+camera.position.set(0, 7.5, 0.001);
 camera.lookAt(0, 0, 0);
 
-// Linen texture — shared across every banner. The fragment shader
-// samples this for the cloth colour and the glyph atlas for the ink
-// silhouette, then blends between them per pixel.
+// Lights. A keylight from the side gives the falling letters
+// visible shadows on the ground; an under-fill keeps the cloth from
+// going pitch-black where it has folded back on itself.
+const key = new THREE.DirectionalLight(0xffffff, 1.4);
+key.position.set(4, 6, 3);
+key.castShadow = true;
+key.shadow.camera.left = -5;
+key.shadow.camera.right = 5;
+key.shadow.camera.top = 5;
+key.shadow.camera.bottom = -5;
+key.shadow.camera.near = 0.5;
+key.shadow.camera.far = 16;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.bias = -0.0005;
+scene.add(key);
+scene.add(new THREE.HemisphereLight(0xffffff, FILL_LIGHT_HEX, 0.45));
+
+// Linen texture used by every cloth letter.
 const linenTex = new THREE.TextureLoader().load("./pattern.jpg", (t) => {
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
   t.colorSpace = THREE.SRGBColorSpace;
@@ -120,146 +120,399 @@ const linenTex = new THREE.TextureLoader().load("./pattern.jpg", (t) => {
 linenTex.wrapS = linenTex.wrapT = THREE.RepeatWrapping;
 linenTex.colorSpace = THREE.SRGBColorSpace;
 
+// Ground plane. Lit by the shadow-casting key light so each cloth
+// drops a clearly readable shadow as it falls. Slightly darker than
+// the scene background so the page visually frames itself.
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(40, 40),
+  new THREE.MeshStandardMaterial({
+    color: new THREE.Color(GROUND_HEX),
+    roughness: 0.95,
+    metalness: 0.0,
+  }),
+);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
 // ------------------------------------------------------------------
-// 4. Per-character cloth shader. The vertex shader simulates a wind
-//    sway with the top edge of each banner pinned (uv.y = 1) and the
-//    bottom edge swinging free. Two cosines drive a lateral sway and
-//    a forward/back curl; the curl folds in extra at the bottom
-//    corners so the cloth reads as draped, not just translated. Each
-//    banner has its own uPhase so they don't oscillate in unison.
+// 4. Cloth simulation. Verlet integration with constraint
+//    relaxation, run on the CPU. The three.js WebGPU example we're
+//    modelling after uses compute shaders, but the algorithm is the
+//    same: integrate, then iteratively pull each pair of connected
+//    particles back to its rest length. A few passes per frame is
+//    enough to keep the cloth stable as it drapes.
+//
+//    Each Cloth instance owns:
+//      • particles[]   — current and previous positions, pinned flag
+//      • springs[]     — index pairs + rest lengths
+//      • mesh / geom   — three.js handle for rendering
+//      • settled       — once average motion stays tiny for a while
+//                        we stop simulating this cloth (huge win for
+//                        long docs).
 // ------------------------------------------------------------------
-const CHAR_W = 0.40;
-const CHAR_H = 0.58;
-// PlaneGeometry is centred on the origin; we move it up by half its
-// height so the *top edge* is at local y=0 (the pinned point).
-const charGeo = new THREE.PlaneGeometry(CHAR_W, CHAR_H, 6, 10);
-charGeo.translate(0, -CHAR_H / 2, 0);
+const CELL = 0.045;      // world units per mask cell
+const CLOTH_THICKNESS = 0.005;
+const GRAVITY = -7.0;
+const SUBSTEPS = 3;
+const CONSTRAINT_ITERS = 5;
+// Wind direction & magnitude: a gentle, time-varying breeze from
+// the top of the screen (the -Z direction in world space because
+// the camera looks straight down).
+const WIND_BASE = new THREE.Vector3(0.0, 0.0, 1.8);
+const WIND_VARY_AMP = 1.0;
+const SETTLE_VEL_THRESHOLD = 0.0008;
+const SETTLE_FRAMES = 60;
 
-const charVertex = /* glsl */ `
-  uniform float uTime;
-  uniform float uPhase;
-  uniform float uAnchorX;
-  varying vec2 vUv;
-  varying float vSway;
+class Cloth {
+  constructor(char, spawnX, spawnZ, dropDelay) {
+    this.char = char;
+    this.spawnX = spawnX;
+    this.spawnZ = spawnZ;
+    this.dropDelay = dropDelay; // seconds before gravity kicks in
+    this.age = 0;
+    this.settledCount = 0;
+    this.settled = false;
 
-  void main() {
-    vec3 pos = position;
-    vUv = uv;
+    const mask = maskFor(char);
+    const M = MASK_RES;
+    // Build particle array and an (x,y) -> particle-index map.
+    this.idxMap = new Int32Array(M * M).fill(-1);
+    const positions = [];
+    const uvs = [];
+    for (let y = 0; y < M; y++) {
+      for (let x = 0; x < M; x++) {
+        if (mask[y * M + x] === 0) continue;
+        // Centre the letter on the spawn point in X/Z; spawn high
+        // above the ground in Y.
+        const wx = spawnX + (x - M / 2) * CELL;
+        const wz = spawnZ + (y - M / 2) * CELL;
+        const wy = 3.0 + Math.random() * 0.2;
+        this.idxMap[y * M + x] = positions.length / 3;
+        positions.push(wx, wy, wz);
+        uvs.push(x / (M - 1), 1 - y / (M - 1));
+      }
+    }
+    const n = positions.length / 3;
+    this.pos = new Float32Array(positions);
+    this.prev = new Float32Array(positions); // start at rest
+    this.pinned = new Uint8Array(n); // all loose
 
-    // free=0 at the anchored top, free=1 at the loose bottom.
-    float free = 1.0 - uv.y;
-    float free2 = free * free;
-    float t = uTime * 1.05 + uPhase;
+    // Springs: 4-neighbour structural + 4-neighbour diagonal + 2-step
+    // bending. Bending springs are what stop a fallen cloth from
+    // crumpling into a hairball — they preserve a rough flatness
+    // over short distances without making the cloth feel rigid.
+    const springs = [];
+    const addSpring = (ax, ay, bx, by) => {
+      if (bx < 0 || bx >= M || by < 0 || by >= M) return;
+      const a = this.idxMap[ay * M + ax];
+      const b = this.idxMap[by * M + bx];
+      if (a < 0 || b < 0) return;
+      const dx = (bx - ax) * CELL;
+      const dz = (by - ay) * CELL;
+      springs.push(a, b, Math.hypot(dx, dz));
+    };
+    for (let y = 0; y < M; y++) {
+      for (let x = 0; x < M; x++) {
+        if (this.idxMap[y * M + x] < 0) continue;
+        addSpring(x, y, x + 1, y);
+        addSpring(x, y, x, y + 1);
+        addSpring(x, y, x + 1, y + 1);
+        addSpring(x, y, x + 1, y - 1);
+        // Bending springs at distance 2.
+        addSpring(x, y, x + 2, y);
+        addSpring(x, y, x, y + 2);
+      }
+    }
+    // Pack springs as parallel typed arrays so the inner relaxation
+    // loop stays in the JIT-friendly integer index path.
+    const ns = springs.length / 3;
+    this.springA = new Uint32Array(ns);
+    this.springB = new Uint32Array(ns);
+    this.springLen = new Float32Array(ns);
+    for (let i = 0; i < ns; i++) {
+      this.springA[i] = springs[i * 3];
+      this.springB[i] = springs[i * 3 + 1];
+      this.springLen[i] = springs[i * 3 + 2];
+    }
 
-    // Big-picture lateral and forward sway — the same gust drives both
-    // axes with slightly different periods so the bottom traces a
-    // soft lissajous instead of a flat side-to-side line.
-    float gust = sin(t * 0.55 + uAnchorX * 0.25);
-    pos.x += (0.085 * gust + 0.025 * sin(t * 1.6)) * free;
-    pos.z += (0.16 * sin(t * 0.85 + 0.6) +
-              0.05 * sin(t * 2.3 + uAnchorX)) * free;
+    // Triangulate every 2×2 cell of the mask whose four corners are
+    // all present. Some cells have only 3 or 2 corners (the edge of
+    // a glyph stroke) — those get a single triangle if we can find
+    // 3 of the 4 corners. Without that fallback the strokes have
+    // visible holes along their boundaries.
+    const indices = [];
+    for (let y = 0; y < M - 1; y++) {
+      for (let x = 0; x < M - 1; x++) {
+        const a = this.idxMap[y * M + x];
+        const b = this.idxMap[y * M + (x + 1)];
+        const c = this.idxMap[(y + 1) * M + x];
+        const d = this.idxMap[(y + 1) * M + (x + 1)];
+        if (a >= 0 && b >= 0 && c >= 0 && d >= 0) {
+          indices.push(a, c, b, b, c, d);
+        } else if (a >= 0 && b >= 0 && c >= 0) {
+          indices.push(a, c, b);
+        } else if (a >= 0 && b >= 0 && d >= 0) {
+          indices.push(a, d, b);
+        } else if (a >= 0 && c >= 0 && d >= 0) {
+          indices.push(a, c, d);
+        } else if (b >= 0 && c >= 0 && d >= 0) {
+          indices.push(b, c, d);
+        }
+      }
+    }
 
-    // Subtle dip: the cloth never floats above its anchor, so the
-    // sin is wrapped through an absolute value.
-    pos.y -= abs(sin(t * 0.65)) * 0.04 * free2;
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(this.pos, 3));
+    geom.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(uvs), 2));
+    geom.setIndex(indices);
+    geom.computeVertexNormals();
 
-    // Vertical fold ripple — a travelling wave along uv.y that bends
-    // the cloth out of plane near the corners. Amplitude grows toward
-    // the bottom corners (free2 * |2u - 1|).
-    float corner = abs(uv.x * 2.0 - 1.0);
-    pos.z += sin(uv.y * 4.5 - t * 1.4 + uPhase * 0.7)
-           * 0.045 * free2 * corner;
-    // Sideways curl — a lateral pinch near the corners.
-    pos.x += sin(uv.y * 5.2 + t * 1.1)
-           * 0.018 * free2 * (uv.x - 0.5) * 2.0;
-
-    vSway = gust;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+    const mat = new THREE.MeshStandardMaterial({
+      map: linenTex,
+      color: 0xffffff,
+      roughness: 0.85,
+      metalness: 0.02,
+      side: THREE.DoubleSide,
+    });
+    this.geom = geom;
+    this.mesh = new THREE.Mesh(geom, mat);
+    this.mesh.castShadow = true;
+    this.mesh.receiveShadow = true;
+    // The bounding sphere is computed once from initial spawn-height
+    // positions; once the cloth falls, that sphere is stale and will
+    // frustum-cull the mesh on near-camera framings. Cheap to just
+    // always draw the cloth.
+    this.mesh.frustumCulled = false;
+    scene.add(this.mesh);
   }
-`;
 
-const charFragment = /* glsl */ `
-  precision highp float;
-  uniform sampler2D uLinenTex;
-  uniform sampler2D uGlyphAtlas;
-  uniform vec2 uGlyphUv;
-  uniform vec2 uGlyphSize;
-  uniform vec3 uInkColor;
-  uniform float uLinenScale;
-  uniform float uAnchorX;
-  uniform float uAnchorY;
-  varying vec2 vUv;
-  varying float vSway;
+  step(dt, t) {
+    if (this.settled) return;
+    this.age += dt;
+    const dropping = this.age >= this.dropDelay;
+    const damp = 0.985;
+    // Wind drifts on uTime so neighbouring cloths receive slightly
+    // different gusts.
+    const windZ = WIND_BASE.z + Math.sin(t * 0.6 + this.spawnX * 0.4) * WIND_VARY_AMP;
+    const windX = Math.sin(t * 0.8 + this.spawnZ * 0.3) * 0.45;
+    const ax = windX * dt * dt;
+    const az = windZ * dt * dt;
+    // While the cloth is still "hanging" at its spawn height (drop
+    // delay hasn't elapsed) we apply only a tiny micro-gust so the
+    // letter visibly wobbles in place before falling.
+    const gravStep = dropping ? GRAVITY * dt * dt : -0.15 * dt * dt;
 
-  void main() {
-    // Linen sampled in *banner-space*, offset by the banner's anchor
-    // so neighbouring banners share a continuous weave rather than
-    // each repeating from zero. uLinenScale controls visible thread
-    // density.
-    vec2 linenUv = (vUv + vec2(uAnchorX, uAnchorY)) * uLinenScale;
-    vec3 linen = texture2D(uLinenTex, linenUv).rgb;
+    const pos = this.pos;
+    const prev = this.prev;
+    let maxMove = 0;
+    for (let i = 0; i < pos.length; i += 3) {
+      // Verlet integrate
+      const x = pos[i], y = pos[i + 1], z = pos[i + 2];
+      const dx = x - prev[i];
+      const dy = y - prev[i + 1];
+      const dz = z - prev[i + 2];
+      prev[i] = x;
+      prev[i + 1] = y;
+      prev[i + 2] = z;
+      const nx = x + dx * damp + ax;
+      const ny = y + dy * damp + gravStep;
+      const nz = z + dz * damp + az;
+      pos[i] = nx;
+      pos[i + 1] = ny;
+      pos[i + 2] = nz;
+      const move = Math.abs(dx) + Math.abs(dy) + Math.abs(dz);
+      if (move > maxMove) maxMove = move;
+    }
 
-    // Glyph atlas — vUv directly indexes into the glyph's cell, with
-    // a tiny inset so the bilinear filter doesn't bleed in colour
-    // from neighbouring cells along the cell boundary.
-    vec2 inset = uGlyphSize * 0.02;
-    vec2 glyphUv = uGlyphUv + inset + vUv * (uGlyphSize - 2.0 * inset);
-    float ink = smoothstep(0.25, 0.65, texture2D(uGlyphAtlas, glyphUv).r);
+    // Constraint relaxation. Each pass nudges every spring back
+    // toward its rest length; a handful of passes is enough to
+    // settle the cloth on the ground without it stretching.
+    const springA = this.springA;
+    const springB = this.springB;
+    const springLen = this.springLen;
+    const ns = springA.length;
+    for (let iter = 0; iter < CONSTRAINT_ITERS; iter++) {
+      for (let i = 0; i < ns; i++) {
+        const a = springA[i] * 3;
+        const b = springB[i] * 3;
+        const rest = springLen[i];
+        const ddx = pos[b] - pos[a];
+        const ddy = pos[b + 1] - pos[a + 1];
+        const ddz = pos[b + 2] - pos[a + 2];
+        const dist2 = ddx * ddx + ddy * ddy + ddz * ddz;
+        if (dist2 < 1e-12) continue;
+        const dist = Math.sqrt(dist2);
+        const diff = (dist - rest) / dist * 0.5;
+        const ox = ddx * diff;
+        const oy = ddy * diff;
+        const oz = ddz * diff;
+        pos[a]     += ox;
+        pos[a + 1] += oy;
+        pos[a + 2] += oz;
+        pos[b]     -= ox;
+        pos[b + 1] -= oy;
+        pos[b + 2] -= oz;
+      }
+    }
 
-    // Fake side-lighting from vSway — when the cloth is mid-gust the
-    // shaded side darkens slightly. Sells the 3D-ness of the warp.
-    float shade = 0.92 + 0.10 * vSway * (vUv.x - 0.5);
+    // Ground collision. Floor at y = CLOTH_THICKNESS so cloth lays
+    // *on top* of the ground rather than co-planar with the shadow
+    // catcher. When a particle hits the floor, we also damp its
+    // horizontal Verlet velocity so the cloth grips rather than
+    // sliding indefinitely on the floor.
+    for (let i = 0; i < pos.length; i += 3) {
+      if (pos[i + 1] < CLOTH_THICKNESS) {
+        pos[i + 1] = CLOTH_THICKNESS;
+        prev[i]     += (pos[i]     - prev[i])     * 0.4;
+        prev[i + 2] += (pos[i + 2] - prev[i + 2]) * 0.4;
+      }
+    }
 
-    vec3 col = mix(linen, uInkColor, ink) * shade;
-    gl_FragColor = vec4(col, 1.0);
+    this.geom.attributes.position.needsUpdate = true;
+    // Recompute normals only every few frames — it's relatively
+    // expensive and the eye can't tell the difference at 60Hz.
+    if (((this.age * 30) | 0) % 2 === 0) {
+      this.geom.computeVertexNormals();
+    }
+
+    // Settle detection. Once movement has been below the threshold
+    // for SETTLE_FRAMES consecutive frames we lock the cloth.
+    if (dropping && maxMove < SETTLE_VEL_THRESHOLD) {
+      this.settledCount++;
+      if (this.settledCount > SETTLE_FRAMES) {
+        this.settled = true;
+        this.geom.computeVertexNormals();
+      }
+    } else {
+      this.settledCount = 0;
+    }
   }
-`;
 
-function makeCharMaterial(glyph, anchorX, anchorY, phase) {
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      uTime: { value: 0 },
-      uPhase: { value: phase },
-      uAnchorX: { value: anchorX },
-      uAnchorY: { value: anchorY },
-      uLinenTex: { value: linenTex },
-      uGlyphAtlas: { value: glyphTex },
-      uGlyphUv: { value: new THREE.Vector2(glyph.u, glyph.v) },
-      uGlyphSize: { value: new THREE.Vector2(glyph.du, glyph.dv) },
-      uInkColor: { value: new THREE.Color(INK_HEX) },
-      uLinenScale: { value: 1.4 },
-    },
-    vertexShader: charVertex,
-    fragmentShader: charFragment,
-  });
+  dispose() {
+    scene.remove(this.mesh);
+    this.geom.dispose();
+    this.mesh.material.dispose();
+  }
 }
 
 // ------------------------------------------------------------------
-// 5. Layout. Characters are laid out in fixed-pitch columns and rows.
-//    A column counter wraps on newline or when the column overflows
-//    the visible width. Layout positions are tracked per-character
-//    so the pointer-hit-test can map a click back to a doc index.
+// 5. Layout. Each typed character gets a (col, row) slot; columns
+//    advance by CHAR_ADV in world X, rows by LINE_PITCH in world Z.
+//    The layout wraps when it reaches the right edge of the visible
+//    page so long docs cascade down the screen.
 // ------------------------------------------------------------------
-const CHAR_ADV = 0.34;   // horizontal pitch between banners
-const LINE_PITCH = 0.78; // vertical pitch between rows
-const COLS_PER_LINE = 16;
+const CHAR_ADV = MASK_RES * CELL * 0.85;
+const LINE_PITCH = MASK_RES * CELL * 1.15;
+const COLS_PER_LINE = 14;
 const START_X = -((COLS_PER_LINE - 1) * CHAR_ADV) / 2;
-const START_Y = 1.5;
+const START_Z = -((4 - 1) * LINE_PITCH) / 2;
 
-let charEntries = []; // { docPos, col, row, mesh, material, char }
+let activeCloths = []; // parallel to currently-displayed printable chars
+let lastSyncedText = "";
 
-function disposeEntry(entry) {
-  scene.remove(entry.mesh);
-  entry.material.dispose();
+function layoutFor(text) {
+  // Returns an array of {char, col, row} for every printable char in
+  // text, doing the same wrap logic so spawnCloth's geometry lines
+  // up.
+  const slots = [];
+  let col = 0;
+  let row = 0;
+  for (const ch of text) {
+    if (ch === "\n") {
+      col = 0;
+      row++;
+      continue;
+    }
+    if (col >= COLS_PER_LINE) {
+      col = 0;
+      row++;
+    }
+    if (ch === " ") {
+      col++;
+      continue;
+    }
+    slots.push({ char: ch, col, row });
+    col++;
+  }
+  return slots;
 }
 
-function rebuildLayout() {
-  for (const e of charEntries) disposeEntry(e);
-  charEntries = [];
+function syncDoc() {
+  const text = view.state.doc.toString();
+  const slots = layoutFor(text);
+
+  // Backspace fast path: new text is a prefix of the last sync. Just
+  // dispose cloths from the end until our count matches — keeps
+  // already-settled cloths in place.
+  if (
+    text.length < lastSyncedText.length &&
+    lastSyncedText.startsWith(text)
+  ) {
+    while (activeCloths.length > slots.length) {
+      activeCloths.pop().dispose();
+    }
+    lastSyncedText = text;
+    return;
+  }
+
+  // Append-only fast path: new text is the previous text plus extra
+  // characters on the end. Spawn fresh cloths for the new slots and
+  // leave the existing ones alone.
+  if (
+    text.length >= lastSyncedText.length &&
+    text.startsWith(lastSyncedText)
+  ) {
+    for (let i = activeCloths.length; i < slots.length; i++) {
+      const s = slots[i];
+      const x = START_X + s.col * CHAR_ADV;
+      const z = START_Z + s.row * LINE_PITCH;
+      // Stagger drops by ~80 ms so very fast typing still reads as
+      // a sequence rather than a single cloud falling at once.
+      const dropDelay = 0.08 * (i - activeCloths.length);
+      activeCloths.push(new Cloth(s.char, x, z, dropDelay));
+    }
+    lastSyncedText = text;
+    return;
+  }
+
+  // General-case (mid-doc edit, paste, undo, etc): drop everything
+  // and rebuild from scratch. Loses settled positions but is
+  // correctness-safe.
+  for (const c of activeCloths) c.dispose();
+  activeCloths = [];
+  for (let i = 0; i < slots.length; i++) {
+    const s = slots[i];
+    const x = START_X + s.col * CHAR_ADV;
+    const z = START_Z + s.row * LINE_PITCH;
+    activeCloths.push(new Cloth(s.char, x, z, 0.05 * i));
+  }
+  lastSyncedText = text;
+}
+
+// ------------------------------------------------------------------
+// 6. Click / drag → caret. Hit the ground plane, convert (x, z) to
+//    a layout cell, walk the doc to find the matching doc position.
+// ------------------------------------------------------------------
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+
+function docPosFromPointer(event) {
+  ndc.x = (event.clientX / window.innerWidth) * 2 - 1;
+  ndc.y = -(event.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObject(ground);
+  if (!hits.length) return view.state.doc.length;
+  const p = hits[0].point;
+  const tCol = Math.round((p.x - START_X) / CHAR_ADV);
+  const tRow = Math.round((p.z - START_Z) / LINE_PITCH);
 
   const text = view.state.doc.toString();
   let col = 0;
   let row = 0;
+  let best = text.length;
+  let bestDist = Infinity;
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (ch === "\n") {
@@ -271,74 +524,14 @@ function rebuildLayout() {
       col = 0;
       row++;
     }
-
-    const x = START_X + col * CHAR_ADV;
-    const y = START_Y - row * LINE_PITCH;
-    // Position-derived phase: a stable hash of (col, row) so each
-    // banner has its own oscillation pattern, but the same physical
-    // slot animates the same way frame to frame even as letters
-    // shift in and out of it as the user edits.
-    const phase = (col * 0.83 + row * 1.71) % 6.2831853;
-
-    const glyph = glyphUvFor(ch);
-    if (glyph) {
-      const mat = makeCharMaterial(glyph, x, y, phase);
-      const mesh = new THREE.Mesh(charGeo, mat);
-      mesh.position.set(x, y, 0);
-      scene.add(mesh);
-      charEntries.push({
-        docPos: i,
-        col,
-        row,
-        mesh,
-        material: mat,
-        char: ch,
-      });
-    } else {
-      // Unprintable but still a layout slot (a space, mostly).
-      charEntries.push({ docPos: i, col, row, mesh: null, material: null, char: ch });
-    }
-    col++;
-  }
-}
-
-// ------------------------------------------------------------------
-// 6. Click / drag → caret. Hit the (flat, undeformed) layout plane,
-//    convert to (col, row), then walk the same layout loop the
-//    visible meshes use to find the doc position underneath.
-// ------------------------------------------------------------------
-const raycaster = new THREE.Raycaster();
-const ndc = new THREE.Vector2();
-const hitPlane = new THREE.Mesh(
-  new THREE.PlaneGeometry(100, 100, 1, 1),
-  new THREE.MeshBasicMaterial({ visible: false }),
-);
-scene.add(hitPlane);
-
-function docPosFromPointer(event) {
-  ndc.x = (event.clientX / window.innerWidth) * 2 - 1;
-  ndc.y = -(event.clientY / window.innerHeight) * 2 + 1;
-  raycaster.setFromCamera(ndc, camera);
-  const hits = raycaster.intersectObject(hitPlane);
-  if (!hits.length) return null;
-  const p = hits[0].point;
-
-  // Target column & row in layout coordinates.
-  const tCol = Math.round((p.x - START_X) / CHAR_ADV);
-  const tRow = Math.round((START_Y - p.y) / LINE_PITCH);
-
-  // Walk the layout and find the doc position whose (col, row)
-  // matches, falling back to the end of the closest visible row.
-  let best = view.state.doc.length;
-  let bestDist = Infinity;
-  for (const e of charEntries) {
-    const dx = e.col - tCol;
-    const dy = e.row - tRow;
-    const d = dx * dx * 0.5 + dy * dy * 1.5;
+    const dx = col - tCol;
+    const dy = row - tRow;
+    const d = dx * dx + dy * dy * 1.8;
     if (d < bestDist) {
       bestDist = d;
-      best = e.docPos;
+      best = i;
     }
+    col++;
   }
   return best;
 }
@@ -381,7 +574,9 @@ stageEl.addEventListener("pointerup", endDrag);
 stageEl.addEventListener("pointercancel", endDrag);
 
 // ------------------------------------------------------------------
-// 7. Resize + animation loop.
+// 7. Resize + animation loop. The CPU sim runs at a fixed substep
+//    rate so the cloth's stability doesn't depend on the browser's
+//    frame rate.
 // ------------------------------------------------------------------
 function resize() {
   const w = window.innerWidth;
@@ -393,27 +588,27 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
+const FIXED_DT = 1 / 60;
 const clock = new THREE.Clock();
+let accumulator = 0;
 function tick() {
-  if (docDirty) {
-    rebuildLayout();
-    docDirty = false;
-  }
-  const t = clock.getElapsedTime();
-  for (const e of charEntries) {
-    if (e.material) e.material.uniforms.uTime.value = t;
+  const frameDt = Math.min(clock.getDelta(), 0.05);
+  accumulator += frameDt;
+  const t = clock.elapsedTime;
+  while (accumulator >= FIXED_DT) {
+    const sub = FIXED_DT / SUBSTEPS;
+    for (let s = 0; s < SUBSTEPS; s++) {
+      for (const c of activeCloths) c.step(sub, t);
+    }
+    accumulator -= FIXED_DT;
   }
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
 
-document.fonts.load(`700 200px "Cormorant Garamond"`).then(() => {
-  // Re-render the glyph atlas now that the web font is actually
-  // available — the very first paint a few lines up used the system
-  // fallback.
-  renderGlyphAtlas();
-  glyphTex.needsUpdate = true;
-  rebuildLayout();
-  docDirty = false;
+document.fonts.load(`900 30px "Bowlby One"`).then(() => {
+  // Invalidate any masks we generated with the fallback font.
+  maskCache.clear();
+  syncDoc();
   tick();
 });

@@ -9,9 +9,9 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #2c3038;
+  background: #1a1c22;
   color: #efe7d3;
-  font-family: "Cormorant Garamond", Georgia, serif;
+  font-family: "Bowlby One", "Inter", sans-serif;
 }
 
 #stage {

@@ -3,12 +3,16 @@ import { markdown } from "https://esm.sh/@codemirror/lang-markdown@6.2.4";
 import * as THREE from "https://esm.sh/three@0.160.0";
 
 // ------------------------------------------------------------------
-// 0. Palette — pale ivory text on dark slate.
+// 0. Palette. The undulating page itself is light (text on tan, same
+//    as the original demo); the scene surrounding the plane is the
+//    dark slate that we drop the page onto. Two separate constants
+//    so the texture and the world can drift apart visually.
 // ------------------------------------------------------------------
-const BG_HEX = "#272a2e";
-const FG_HEX = "#e8e2d3";
-const SELECTION_RGBA = "rgba(232, 226, 211, 0.22)";
-const BORDER_RGBA = "rgba(232, 226, 211, 0.18)";
+const BG_HEX = "#efe5cb";        // page background painted on the canvas
+const FG_HEX = "#1f1209";        // ink colour on that page
+const SELECTION_RGBA = "rgba(31, 18, 9, 0.22)";
+const BORDER_RGBA = "rgba(31, 18, 9, 0.18)";
+const SCENE_BG_HEX = "#272a2e";  // dark slate behind the warped plane
 
 // ------------------------------------------------------------------
 // 1. Hidden CodeMirror 6 editor (owns input, selection, history)
@@ -232,7 +236,7 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight, false);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(BG_HEX);
+scene.background = new THREE.Color(SCENE_BG_HEX);
 
 const camera = new THREE.PerspectiveCamera(
   42,
